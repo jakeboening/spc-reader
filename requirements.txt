@@ -1,0 +1,4 @@
+yoctopuce>=2.0.0
+matplotlib>=3.7.0
+numpy>=1.23
+h5py>=3.0

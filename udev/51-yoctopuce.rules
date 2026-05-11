@@ -1,0 +1,2 @@
+# Yoctopuce USB vendor id 0x24e0 — install to /etc/udev/rules.d/ then: sudo udevadm control --reload-rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="24e0", MODE="0666"
