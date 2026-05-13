@@ -37,6 +37,7 @@ import collections
 import datetime
 import os
 import sys
+import time
 
 # Use TkAgg to avoid MESA-INTEL Vulkan "FINISHME" warnings from Qt/GTK backends.
 os.environ.setdefault("MPLBACKEND", "TkAgg")
@@ -171,16 +172,21 @@ def find_sensors(serial):
     YAPI.UpdateDeviceList(errmsg)   # force discovery before checking isOnline()
 
     s1 = YTemperature.FindTemperature(f"{serial}.temperature1")
-    if not s1.isOnline():
-        sys.exit(f"Sensor {serial}.temperature1 not found or offline.\n"
-                 "Check that the device is plugged in and VirtualHub has claimed it.")
-    print(f"  Ch1: {serial}.temperature1 online")
+    if s1.isOnline():
+        print(f"  Ch1: {serial}.temperature1 online")
+    else:
+        print(f"  Ch1: {serial}.temperature1 not online — will log NaN")
 
     s2 = YTemperature.FindTemperature(f"{serial}.temperature2")
     if s2.isOnline():
         print(f"  Ch2: {serial}.temperature2 online")
     else:
         print(f"  Ch2: {serial}.temperature2 not online — will log NaN")
+
+    if not s1.isOnline() and not s2.isOnline():
+        sys.exit(f"Neither {serial}.temperature1 nor {serial}.temperature2 is online.\n"
+                 "Check that the device is plugged in and VirtualHub has claimed it.")
+
     return s1, s2
 
 
@@ -192,7 +198,8 @@ def main():
     connect_hub(args.hub, args.user, args.password)
     sensor1, sensor2 = find_sensors(args.serial)
 
-    sensor1.set_reportFrequency(f"{int(args.hz)}/s")
+    if sensor1.isOnline():
+        sensor1.set_reportFrequency(f"{int(args.hz)}/s")
     if sensor2.isOnline():
         sensor2.set_reportFrequency(f"{int(args.hz)}/s")
 
@@ -228,7 +235,8 @@ def main():
         v = measure.get_averageValue()
         pending_ch2.append((t, v))
 
-    sensor1.registerTimedReportCallback(on_ch1_report)
+    if sensor1.isOnline():
+        sensor1.registerTimedReportCallback(on_ch1_report)
     if sensor2.isOnline():
         sensor2.registerTimedReportCallback(on_ch2_report)
 
@@ -283,7 +291,9 @@ def main():
         v1_arr = np.array(live["v1"])
         v2_arr = np.array(live["v2"])
 
-        x_display = ax.transData.transform(np.column_stack([t_arr, v1_arr]))[:, 0]
+        # Use a finite reference row for pixel-space x lookup (either channel).
+        ref_arr = v1_arr if not np.all(np.isnan(v1_arr)) else v2_arr
+        x_display = ax.transData.transform(np.column_stack([t_arr, ref_arr]))[:, 0]
         idx = int(np.argmin(np.abs(x_display - event.x)))
 
         tx  = t_arr[idx]
@@ -291,14 +301,21 @@ def main():
         ty2 = v2_arr[idx]
         ts  = mdates.num2date(tx).strftime("%H:%M:%S.%f")[:-3]
 
-        hover_dot1.set_data([tx], [ty1])
-        hover_dot2.set_data([tx], [ty2])
-        hover_ann.xy = (tx, ty1)
-        v2_str = f"{ty2:.2f}" if not np.isnan(ty2) else "—"
+        hover_ann.xy = (tx, ty1) if not np.isnan(ty1) else (tx, ty2)
+        ty1_str = f"{ty1:.2f} °C" if not np.isnan(ty1) else "Disconnected"
+        ty2_str = f"{ty2:.2f} °C" if not np.isnan(ty2) else "Disconnected"
+        if not np.isnan(ty1):
+            hover_dot1.set_data([tx], [ty1])
+        else:
+            hover_dot1.set_data([], [])
+        if not np.isnan(ty2):
+            hover_dot2.set_data([tx], [ty2])
+        else:
+            hover_dot2.set_data([], [])
         hover_ann.set_text(
             f"{ts}\n"
-            f"{args.ch1_name}: {ty1:.2f} °C\n"
-            f"{args.ch2_name}: {v2_str} °C"
+            f"{args.ch1_name}: {ty1_str}\n"
+            f"{args.ch2_name}: {ty2_str}"
         )
         hover_ann.set_visible(True)
 
@@ -318,14 +335,31 @@ def main():
     # frame — no polling, no missed/duplicate samples.
 
     GUI_INTERVAL_MS = 50
+    _last_devlist_update = [0.0]
+    DEVLIST_INTERVAL = 1.0
+
+    # Unix timestamp of the last sample we successfully committed for each
+    # channel.  Used for the grace-period logic below.
+    _last_ch1_unix = [0.0]
+    _last_ch2_unix = [0.0]
 
     def update(_frame):
+        now = time.monotonic()
+        if now - _last_devlist_update[0] >= DEVLIST_INTERVAL:
+            errmsg = YRefParam()
+            YAPI.UpdateDeviceList(errmsg)
+            _last_devlist_update[0] = now
         YAPI.HandleEvents()
 
-        # Drain ch1 reports.  For each ch1 timestamp, find the closest ch2
-        # report (they arrive from the same hardware tick but via separate
-        # callbacks, so pair them by timestamp).
-        if not pending_ch1:
+        # Drain reports from whichever channels have data.  When both are
+        # active, pair ch2 to ch1 by nearest timestamp (they share the same
+        # hardware tick but endTimeUTC can differ by a few milliseconds).
+        # When only one channel has data this frame but the other was active
+        # within the last two sample periods, defer the lone batch for one
+        # more frame rather than logging NaN — this eliminates the
+        # "Disconnected" flicker caused by callback timing jitter on
+        # reconnect and normal inter-frame scheduling noise.
+        if not pending_ch1 and not pending_ch2:
             return (line1, line2, readout)
 
         ch1_batch = pending_ch1[:]
@@ -333,30 +367,67 @@ def main():
         pending_ch1.clear()
         pending_ch2.clear()
 
-        # Pair ch2 reports to ch1 by nearest timestamp within half a sample
-        # period.  The two channels share the same hardware tick but their
-        # endTimeUTC values can differ by a few milliseconds, so exact
-        # equality matching almost never works.
         half_period = 0.5 / args.hz
-        ch2_times = [t for t, _ in ch2_batch]
-        ch2_vals  = [v for _, v in ch2_batch]
-        ch2_used  = [False] * len(ch2_batch)
+        # Two sample periods is long enough to absorb any inter-frame jitter
+        # while still declaring a channel offline promptly.
+        grace = 2.0 / args.hz
+        now_unix = time.time()
 
-        for t_unix, v1 in ch1_batch:
-            v2 = float("nan")
-            if ch2_times:
+        if ch1_batch and ch2_batch:
+            # Both channels reported this frame — both are definitively
+            # connected.  Pair ch2 to ch1 by nearest timestamp; no distance
+            # gate since we already know both are live (the half_period
+            # constraint was causing false "Disconnected" on reconnect when
+            # timestamps hadn't re-synced yet).
+            _last_ch1_unix[0] = ch1_batch[-1][0]
+            _last_ch2_unix[0] = ch2_batch[-1][0]
+            ch2_times = [t for t, _ in ch2_batch]
+            ch2_vals  = [v for _, v in ch2_batch]
+            ch2_used  = [False] * len(ch2_batch)
+
+            for t_unix, v1 in ch1_batch:
                 diffs = [abs(t_unix - t2) for t2 in ch2_times]
                 best  = int(np.argmin(diffs))
-                if diffs[best] <= half_period and not ch2_used[best]:
+                if not ch2_used[best]:
                     v2 = ch2_vals[best]
                     ch2_used[best] = True
+                else:
+                    # All ch2 samples already claimed; carry forward the most
+                    # recent ch2 value (channel is still alive).
+                    v2 = ch2_vals[-1]
 
-            t_mpl = mdates.date2num(datetime.datetime.fromtimestamp(t_unix))
-            times.append(t_mpl)
-            temps1.append(v1)
-            temps2.append(v2)
+                t_mpl = mdates.date2num(datetime.datetime.fromtimestamp(t_unix))
+                times.append(t_mpl)
+                temps1.append(v1)
+                temps2.append(v2)
+                logger.append(t_unix, v1, v2)
 
-            logger.append(t_unix, v1, v2)
+        elif ch1_batch:
+            if now_unix - _last_ch2_unix[0] < grace:
+                # Ch2 was recently active; it probably just landed in a
+                # different frame.  Put ch1 back and wait one more tick.
+                pending_ch1[:0] = ch1_batch
+                return (line1, line2, readout)
+            _last_ch1_unix[0] = ch1_batch[-1][0]
+            for t_unix, v1 in ch1_batch:
+                t_mpl = mdates.date2num(datetime.datetime.fromtimestamp(t_unix))
+                times.append(t_mpl)
+                temps1.append(v1)
+                temps2.append(float("nan"))
+                logger.append(t_unix, v1, float("nan"))
+
+        else:
+            if now_unix - _last_ch1_unix[0] < grace:
+                # Symmetric: defer ch2 until ch1 catches up.
+                pending_ch2[:0] = ch2_batch
+                return (line1, line2, readout)
+            _last_ch2_unix[0] = ch2_batch[-1][0]
+            for t_unix, v2 in ch2_batch:
+                t_mpl = mdates.date2num(datetime.datetime.fromtimestamp(t_unix))
+                times.append(t_mpl)
+                temps1.append(float("nan"))
+                temps2.append(v2)
+                logger.append(t_unix, float("nan"), v2)
 
         if len(times) < 2:
             return (line1, line2, readout)
@@ -384,11 +455,13 @@ def main():
 
         v1_last = temps1[-1]
         v2_last = temps2[-1]
-        v2_str = f"{v2_last:.2f}" if not np.isnan(v2_last) else "  —  "
-        t_last = datetime.datetime.fromtimestamp(ch1_batch[-1][0])
+        v1_str = f"{v1_last:.2f} °C" if not np.isnan(v1_last) else "Disconnected"
+        v2_str = f"{v2_last:.2f} °C" if not np.isnan(v2_last) else "Disconnected"
+        last_batch = ch1_batch if ch1_batch else ch2_batch
+        t_last = datetime.datetime.fromtimestamp(last_batch[-1][0])
         readout.set_text(
-            f"{args.ch1_name}: {v1_last:.2f} °C\n"
-            f"{args.ch2_name}: {v2_str} °C\n"
+            f"{args.ch1_name}: {v1_str}\n"
+            f"{args.ch2_name}: {v2_str}\n"
             f"{t_last.strftime('%H:%M:%S.%f')[:-3]}"
         )
         return (line1, line2, readout)
