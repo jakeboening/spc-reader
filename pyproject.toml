@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spc-reader"
+version = "0.1.0"
+description = "Mitutoyo SPC displacement and Mark-10 force logger with live plotting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pyserial>=3.5",
+    "pyusb>=1.2.0",
+    "matplotlib>=3.10.4",
+    "numpy>=1.23",
+    "h5py>=3.0",
+]
+
+[project.scripts]
+spc-plot = "spc_reader.plot_live:main"
+spc-plot-cycle = "spc_reader.plot_cycle:main"
+spc-reader-install-udev = "spc_reader.install_udev:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spc_reader = ["udev/*.rules"]

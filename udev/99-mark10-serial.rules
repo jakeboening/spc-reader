@@ -1,0 +1,6 @@
+# Mark-10 Series 5 force gauge (USB virtual serial).
+# Install: sudo cp udev/99-mark10-serial.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+# Replug the gauge after reloading udev.
+
+SUBSYSTEM=="tty", ATTRS{manufacturer}=="Mark-10", MODE="0666", GROUP="dialout"

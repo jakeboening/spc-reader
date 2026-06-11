@@ -1,0 +1,8 @@
+# Mitutoyo USB-ITN (0fe7:4001) — libusb access for spc-reader (pyusb).
+# Install: sudo cp udev/99-mitutoyo-serial.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+# Replug the USB-ITN, ensure your user is in group dialout, then log out/in.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fe7", ATTR{idProduct}=="4001", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fe7", ATTRS{idProduct}=="4001", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0fe7", MODE="0660", GROUP="dialout"

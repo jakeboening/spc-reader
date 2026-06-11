@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Local measurement logs (per-user data lives in ~/.local/share/spc-reader/)
+data/*.h5

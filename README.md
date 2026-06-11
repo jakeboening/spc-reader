@@ -1,177 +1,157 @@
-# Thermocouple live plotter — THRMCPL1-2BBF97
+# Force and displacement logger
 
-Real-time temperature plot and HDF5 data logger for the **Yocto-Thermocouple** (serial **THRMCPL1-2BBF97**) via **VirtualHub V2**.
+Real-time dual-channel plot and HDF5 logger:
 
-- 600 s scrolling window, 20–800 °C Y-axis, 5 Hz sampling
-- Hover tooltip snapping to nearest recorded sample
-- Every run is saved as a numbered *cycle* in `data/temperature_log.h5` with an optional free-text tag
+- **Mitutoyo Digimatic SPC** linear displacement (mm) on the 10-pin connector (USB-ITN, IT-016U, or serial bridge)
+- **Mark-10 Series 5** force (N), e.g. M5-10 (10 lbf ≈ 44.5 N full scale) over USB virtual serial (GCL2)
+
+- 600 s scrolling window; displacement **0–30 mm**, force **±44.5 N** (defaults for M5-10)
+- Hover tooltip on the live chart
+- Each user’s log defaults to **`~/.local/share/spc-reader/force_and_displacement.h5`**
 
 ---
 
-## Prerequisites
+## System install (all users)
 
-### Python packages
+Install the package and udev rules once as root. Each user runs `spc-plot` with their own data directory.
+
+```bash
+cd /path/to/spc-reader
+sudo pip install .
+sudo spc-reader-install-udev
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Add each user who will use serial devices to the **`dialout`** group, then log out and back in:
+
+```bash
+sudo usermod -aG dialout USERNAME
+```
+
+GUI (Fedora example):
+
+```bash
+sudo dnf install python3-tkinter python3-pillow-tk
+```
+
+`python3-pillow-tk` provides Pillow’s **ImageTk** bindings (toolbar icons on the plot window). Without it you may see an ImageTk warning; the chart still works and the warning is suppressed in recent `spc-reader` builds.
+
+Replug USB devices after udev reload.
+
+### Commands (after install)
+
+| Command | Purpose |
+|---------|---------|
+| `spc-plot` | Live plot + log |
+| `spc-plot-cycle` | List or replay logged cycles |
+| `spc-reader-install-udev` | Install udev rules to `/etc/udev/rules.d/` |
+
+### Per-user data
+
+| Path | Contents |
+|------|----------|
+| `~/.local/share/spc-reader/` | Default log directory |
+| `~/.local/share/spc-reader/force_and_displacement.h5` | Default HDF5 log |
+
+Override with `$XDG_DATA_HOME/spc-reader/` if set. Use `--data-file` for a custom path.
+
+---
+
+## ImageTk warning on another user account
+
+If `spc-plot` prints a Pillow/ImageTk warning but the window appears, install Tk support for that user’s Python environment and re-login:
+
+```bash
+sudo dnf install python3-tkinter python3-pillow-tk   # Fedora
+```
+
+Then reinstall or upgrade the package so matplotlib warning filters apply:
+
+```bash
+sudo pip install --upgrade .
+```
+
+---
+
+## Development / git checkout
+
+```bash
+pip install -e .
+./scripts/run-plot.sh --list-ports
+```
+
+Or without install:
 
 ```bash
 pip install -r requirements.txt
+./scripts/run-plot.sh
 ```
 
-Packages: `yoctopuce`, `matplotlib`, `numpy`, `h5py`.
+---
 
-On Fedora, `tkinter` (the matplotlib GUI backend used here) is a separate system package:
+## Wiring
 
-```bash
-sudo dnf install python3-tkinter
+```
+Gauge ── 10-pin SPC cable ── USB Input Tool (USB-ITN / IT-020U / …) ── PC USB
+Mark-10 M5-10 ── micro USB ── PC USB  (gauge menu: Serial/USB → USB selected)
 ```
 
-### VirtualHub V2
+USB-ITN appears as USB `0fe7:4001` and is read via **pyusb** (not a tty). The Mark-10 exposes a virtual COM port (`/dev/ttyUSB*` or `/dev/ttyACM*`).
 
-The `VirtualHubV2.linux.69177/` directory contains the pre-built binary. No installation needed — `run-plot.sh` starts it automatically.
-
-### USB permissions
-
-Copy the udev rule so VirtualHub can access the device without root:
-
-```bash
-sudo cp udev/51-yoctopuce.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
-```
-
-Replug the module after reloading udev.
+On the Mark-10: open **Serial/USB Settings**, select **USB**, set baud to **115200** (match `--force-baud`) and **Numeric + Units** data format. The gauge must be on the main measurement screen (not a menu) for GCL2 commands.
 
 ---
 
 ## Run
 
 ```bash
-./scripts/run-plot.sh
+spc-plot --list-ports
+spc-plot
+spc-plot --port usb-itn:40006743 --tag "run 42"
+spc-plot --force-port /dev/ttyUSB0
+spc-plot --no-force
 ```
 
-With a tag describing the test configuration:
-
-```bash
-./scripts/run-plot.sh --tag "substrate A, 300 W, 60 s dwell"
-```
-
-The tag appears as a subtitle on the plot and is stored in the HDF5 file.
-
-`run-plot.sh` starts VirtualHub on port 4443 if nothing is already listening there, waits for it to be ready, then launches the plotter. VirtualHub is stopped on exit only if this script was the one that started it.
-
-### All options
-
-All flags are passed through from `run-plot.sh` (or `yoctotemp`) to `plot_temperature.py`.
+With the plot window focused, press **r** to flush the current HDF5 cycle, start a new one, and clear the rolling chart.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--hub HOST:PORT` | `127.0.0.1:4443` | VirtualHub HTTPS address |
-| `--user USER` | `user` | VirtualHub username |
-| `--password PW` | `!asml!asml` | VirtualHub password |
-| `--serial SERIAL` | `THRMCPL1-2BBF97` | Module serial prefix |
-| `--window SECS` | `600` | Rolling window width in seconds |
-| `--ymin TEMP` | `20` | Y-axis minimum °C |
-| `--ymax TEMP` | `800` | Y-axis maximum °C |
-| `--hz HZ` | `5` | Polling rate in Hz (written to firmware) |
-| `--ch1-name NAME` | `Ch 1` | Label for temperature1 in the legend and tooltip |
-| `--ch2-name NAME` | `Ch 2` | Label for temperature2 in the legend and tooltip |
-| `--tag TEXT` | *(empty)* | Free-text label stored with this cycle |
-| `--data-file PATH` | `data/temperature_log.h5` | HDF5 log file |
+| `--port PATH` | auto | Mitutoyo: `usb-itn`, `usb-itn:SERIAL`, or `/dev/tty*` |
+| `--force-port PATH` | auto | Mark-10 USB serial |
+| `--force-baud` | `115200` | Mark-10 baud (must match gauge) |
+| `--no-force` | off | Skip force channel |
+| `--window SECS` | `600` | Rolling window |
+| `--ymin` / `--ymax` | `0` / `30` | Displacement Y-axis (mm) |
+| `--fmin` / `--fmax` | ±44.5 N | Force Y-axis (N); default is M5-10 full scale |
+| `--hz` | `20` | Poll rate |
+| `--data-file` | see above | HDF5 log |
 
-Environment variables recognised by `run-plot.sh`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VHUB_PORT` | `4443` | HTTPS port VirtualHub listens on (used by YAPI) |
-| `VHUB_HTTP_PORT` | `4444` | Plain HTTP port VirtualHub listens on |
-| `PYTHON` | `python3` | Python interpreter to use |
+Replay:
 
 ```bash
-./scripts/run-plot.sh --window 300 --ymin 20 --ymax 500 --hz 1
-./scripts/run-plot.sh --ch1-name "Top" --ch2-name "Bottom" --tag "run 42"
-VHUB_PORT=4443 ./scripts/run-plot.sh   # if VirtualHub is on a non-default port
+spc-plot-cycle
+spc-plot-cycle last
+```
+
+Older logs (`displacement_log.h5`, `temperature_log.h5`) still work with `--data-file` (legacy dataset names for displacement-only files).
+
+---
+
+## HDF5 layout
+
+```
+cycles/000001/
+  time              float64[]   Unix epoch (UTC)
+  displacement_mm   float32[]   linear displacement (mm)
+  force_n           float32[]   force (N), when Mark-10 was connected
+  attrs: tag, serial, hz, start_iso, units, channel_name
+          force_serial, force_units, force_channel_name  (when force logged)
 ```
 
 ---
 
-## HDF5 data log
+## Protocols
 
-Each run appends a new cycle to `data/temperature_log.h5` (gitignored).
+**Mitutoyo:** host sends `1` + CR; adapter returns a text line (e.g. `01A+12.345`). Inch readings are converted to mm.
 
-```
-cycles/
-  000001/          ← first run
-    time           float64[], Unix epoch seconds (UTC)
-    temperature    float32[], °C
-    attrs: tag, serial, hz, start_iso
-  000002/          ← second run
-    ...
-```
-
-### Reading back
-
-```python
-import h5py, numpy as np
-
-with h5py.File("data/temperature_log.h5", "r") as f:
-    for name, grp in f["cycles"].items():
-        t = grp["time"][:]
-        T = grp["temperature"][:]
-        print(name, grp.attrs["tag"], f"{T.min():.1f}–{T.max():.1f} °C  n={len(T)}")
-```
-
-### Plotting a past cycle with `yoctotemp-plot`
-
-`yoctotemp-plot` (or `./scripts/plot_cycle.py`) opens an interactive Matplotlib window for any saved cycle.
-
-```bash
-yoctotemp-plot          # list all recorded cycles
-yoctotemp-plot 3        # plot cycle 3
-yoctotemp-plot last     # plot the most recent cycle
-```
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `cycle` *(positional)* | *(list all)* | Cycle number to plot, or `last` |
-| `--data-file PATH` | `data/temperature_log.h5` | HDF5 log file to read from |
-
-### Plotting a past cycle manually
-
-```python
-import h5py, numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from datetime import datetime, timezone
-
-with h5py.File("data/temperature_log.h5", "r") as f:
-    grp = f["cycles/000001"]
-    t = grp["time"][:]
-    T = grp["temperature"][:]
-    tag = grp.attrs["tag"]
-
-dt = [datetime.fromtimestamp(ts, tz=timezone.utc).astimezone() for ts in t]
-
-fig, ax = plt.subplots(figsize=(13, 5))
-ax.plot(dt, T, color="tomato", linewidth=1.5)
-ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-ax.set_ylabel("Temperature (°C)")
-ax.set_title(f"Cycle 000001 — {tag}")
-fig.autofmt_xdate()
-plt.tight_layout()
-plt.show()
-```
-
----
-
-## Sampling rate
-
-The `--hz` value is written to the module's `reportFrequency` register on each launch and persists in firmware. The Yocto-Thermocouple supports up to **10/s**; the default is **5/s**.
-
-## Standalone datalogger
-
-The module can log to its own flash without a PC:
-
-1. While connected, enable logging via VirtualHub (device → `temperature1` → **Sensor recording**) and set report frequency.
-2. Sync the module clock via VirtualHub.
-3. Power the board (USB host, charger, or YoctoHub) — it logs without a PC app running.
-4. After the run, reconnect and download via VirtualHub or the Python API.
-
-**Flash capacity at 5 Hz:** Yoctopuce guarantees ≥ 500 000 records. With one channel at 5 Hz that is ≈ 27.8 h before oldest samples are overwritten.
+**Mark-10 GCL2:** host sends `?C` + CR for the real-time reading, or consumes auto-output lines. The gauge may send e.g. `0.42 N` or `0.094 lbF`; values are normalized to **N** for plot and log.
