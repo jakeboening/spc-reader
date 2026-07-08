@@ -513,7 +513,9 @@ def list_rs485_ports() -> list[tuple[str, str]]:
         # macOS: USB serial adapters appear as /dev/cu.*; require a USB VID to
         # skip Bluetooth/debug pseudo-ports.
         is_mac_usb = base.startswith("cu.") and info.vid is not None
-        if not (is_linux_usb or is_mac_usb):
+        # Windows: COMx; require a USB VID to skip motherboard UARTs.
+        is_win_usb = base.upper().startswith("COM") and info.vid is not None
+        if not (is_linux_usb or is_mac_usb or is_win_usb):
             continue
         label = info.description or "USB serial"
         if info.manufacturer:
