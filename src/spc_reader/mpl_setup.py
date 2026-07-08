@@ -8,9 +8,22 @@ Import this module before ``matplotlib.pyplot`` in any GUI entry point::
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 
-os.environ.setdefault("MPLBACKEND", "TkAgg")
+
+def _default_backend() -> str:
+    if sys.platform == "darwin":
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            # Homebrew Python often lacks tkinter; the native Cocoa backend
+            # supports blitting, so live-plot performance is unaffected.
+            return "macosx"
+    return "TkAgg"
+
+
+os.environ.setdefault("MPLBACKEND", _default_backend())
 
 # Pillow 11.3+ / TkAgg (fixed upstream in matplotlib >= 3.10.4).
 warnings.filterwarnings(

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spc-reader"
 version = "0.1.0"
-description = "Mitutoyo SPC displacement and Mark-10 force logger with live plotting"
+description = "Mitutoyo SPC displacement and force logger (Mark-10 or RS485 load cell) with live plotting"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -20,7 +20,8 @@ dependencies = [
 [project.scripts]
 spc-plot = "spc_reader.plot_live:main"
 spc-plot-cycle = "spc_reader.plot_cycle:main"
-spc-reader-install-udev = "spc_reader.install_udev:main"
+spc-loadcell-probe = "spc_reader.loadcell_io:probe_main"
+spc-loadcell-cal = "spc_reader.loadcell_io:cal_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

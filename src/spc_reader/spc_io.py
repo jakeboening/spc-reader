@@ -21,6 +21,7 @@ UNITS = {0: "mm", 1: "in"}
 
 DISPLACEMENT_DATASET = "displacement_mm"
 FORCE_DATASET = "force_n"
+FORCE_COUNTS_DATASET = "force_counts"
 LBF_TO_N = 4.4482216152605
 DEFAULT_LOG_FILENAME = "force_and_displacement.h5"
 # Legacy log filenames (still readable via --data-file):
@@ -164,8 +165,14 @@ def find_usb_itn(serial: str | None = None) -> list[DeviceInfo]:
     except ImportError:
         return []
 
+    try:
+        found = usb.core.find(find_all=True, idVendor=MITUTOYO_VID, idProduct=USB_ITN_PID)
+    except usb.core.NoBackendError:
+        # No libusb on this system (common on macOS without `brew install libusb`).
+        return []
+
     devices: list[DeviceInfo] = []
-    for dev in usb.core.find(find_all=True, idVendor=MITUTOYO_VID, idProduct=USB_ITN_PID) or []:
+    for dev in found or []:
         sn = _usb_sysfs_serial(dev)
         if serial and sn != serial:
             continue
@@ -212,15 +219,23 @@ def discover_devices() -> list[DeviceInfo]:
     return out
 
 
-def read_displacement_mm(grp) -> "np.ndarray":
-    """Load displacement samples from a cycle group (current or legacy dataset names)."""
+def try_read_displacement_mm(grp) -> "np.ndarray | None":
+    """Load displacement samples if present; otherwise None."""
     import numpy as np
     for key in _LEGACY_DISPLACEMENT_KEYS:
         if key in grp:
             return grp[key][:]
-    raise KeyError(
-        f"no displacement dataset in cycle (expected one of {_LEGACY_DISPLACEMENT_KEYS})"
-    )
+    return None
+
+
+def read_displacement_mm(grp) -> "np.ndarray":
+    """Load displacement samples from a cycle group (current or legacy dataset names)."""
+    mm = try_read_displacement_mm(grp)
+    if mm is None:
+        raise KeyError(
+            f"no displacement dataset in cycle (expected one of {_LEGACY_DISPLACEMENT_KEYS})"
+        )
+    return mm
 
 
 def read_force_n(grp) -> "np.ndarray | None":

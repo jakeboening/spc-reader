@@ -28,7 +28,16 @@ def default_log_path() -> str:
 
 
 def resolve_data_path(path: str) -> str:
-    """Expand a log path; relative paths are under ``user_data_dir()``."""
-    if os.path.isabs(path):
-        return path
-    return str(user_data_dir() / path)
+    """Expand a log path.
+
+    Absolute paths (and ``~``) are used as-is. A relative path is resolved
+    against the current directory if it exists there or is written
+    explicitly (``./`` or ``../``); otherwise it falls back to
+    ``user_data_dir()``.
+    """
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return str(p)
+    if p.exists() or path.startswith(("./", "../")):
+        return str(p.resolve())
+    return str(user_data_dir() / p)
