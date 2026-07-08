@@ -35,6 +35,28 @@ spc-loadcell-cal --port /dev/cu.usbserial-B0009XBW
 
 ---
 
+## Windows quick-start
+
+Install **Python 3.10+** from [python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*; tkinter is included, so the plot window works out of the box). Then in PowerShell:
+
+```powershell
+cd $HOME\src\spc-reader
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+spc-plot --list-ports          # find the adapter, e.g. COM5
+spc-plot --no-displacement --force-type loadcell --force-port COM5 --loadcell-range 100kg
+spc-plot --force-port COM4     # Mark-10
+```
+
+Serial devices appear as **COMx** ports (also visible in *Device Manager → Ports (COM & LPT)*). Windows Update normally installs the USB serial driver for the Mark-10 and for common RS485 adapter chips (FTDI, CP210x, CH340) automatically on first plug-in; if a device shows up with a warning icon instead of a COM port, install the chip vendor's driver.
+
+The default log is `%USERPROFILE%\.local\share\spc-reader\force_and_displacement.h5` (same `~/.local/share` convention as Linux/macOS).
+
+**Displacement on Windows:** an IT-016U or RS-232 serial bridge works as a normal COM port (`--port COM6`). The **USB-ITN** is read through pyusb, which on Windows additionally needs a libusb-1.0 backend and the WinUSB driver bound to the adapter (e.g. with [Zadig](https://zadig.akeo.ie/)) — it has only been tested on Linux/macOS. Force-only mode (`--no-displacement`) avoids this entirely.
+
+---
+
 ## System install (all users)
 
 Install the package and udev rules once as root. Each user runs `spc-plot` with their own data directory.
@@ -121,7 +143,7 @@ Mark-10 M5-10 ── micro USB ── PC USB  (gauge menu: Serial/USB → USB se
 Load cell ── 4-wire ── RS485 transmitter ── USB-RS485 adapter ── PC USB
 ```
 
-USB-ITN appears as USB `0fe7:4001` and is read via **pyusb** (not a tty). The Mark-10 exposes a virtual COM port (`/dev/ttyUSB*` or `/dev/ttyACM*`). An RS485 load cell transmitter connects through a USB-RS485 adapter on `/dev/ttyUSB*` (macOS: `/dev/cu.usbserial-*`).
+USB-ITN appears as USB `0fe7:4001` and is read via **pyusb** (not a tty). The Mark-10 exposes a virtual COM port (`/dev/ttyUSB*` or `/dev/ttyACM*`). An RS485 load cell transmitter connects through a USB-RS485 adapter on `/dev/ttyUSB*` (macOS: `/dev/cu.usbserial-*`, Windows: `COMx`).
 
 On the Mark-10: open **Serial/USB Settings**, select **USB**, set baud to **115200** (match `--force-baud`) and **Numeric + Units** data format. The gauge must be on the main measurement screen (not a menu) for GCL2 commands.
 
@@ -152,7 +174,7 @@ With the plot window focused:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port PATH` | auto | Mitutoyo: `usb-itn`, `usb-itn:SERIAL`, or `/dev/tty*` |
-| `--force-port PATH` | auto | Mark-10 USB serial or RS485 adapter (`/dev/tty*`) |
+| `--force-port PATH` | auto | Mark-10 USB serial or RS485 adapter (`/dev/tty*`, `COMx`) |
 | `--force-type` | `mark10` | `mark10` or `loadcell` (RS485 Modbus RTU) |
 | `--force-baud` | see below | `115200` (Mark-10) or `9600` (load cell) |
 | `--loadcell-range` | `100kg` | Full scale: `10kg` … `1000kg` (sets Y-axis and scaling metadata) |
