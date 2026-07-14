@@ -24,8 +24,16 @@ FORCE_DATASET = "force_n"
 FORCE_COUNTS_DATASET = "force_counts"
 # The "_c" suffix is load-bearing: bare "temperature1" is a legacy alias for
 # displacement (see _LEGACY_DISPLACEMENT_KEYS) and must stay distinct.
+# Thermocouples are numbered continuously across modules: module i (0-based)
+# logs temperature{2i+1}_c and temperature{2i+2}_c.
 TEMP1_DATASET = "temperature1_c"
 TEMP2_DATASET = "temperature2_c"
+_TEMP_DATASET_RE = re.compile(r"temperature(\d+)_c$")
+
+
+def temp_dataset(k: int) -> str:
+    """Dataset name for thermocouple number ``k`` (1-based)."""
+    return f"temperature{k}_c"
 LBF_TO_N = 4.4482216152605
 DEFAULT_LOG_FILENAME = "force_and_displacement.h5"
 # Legacy log filenames (still readable via --data-file):
@@ -252,12 +260,14 @@ def read_force_n(grp) -> "np.ndarray | None":
     return None
 
 
-def read_temperatures_c(grp) -> "tuple[np.ndarray | None, np.ndarray | None]":
-    """(temperature1_c, temperature2_c) arrays; None per missing channel."""
-    return (
-        grp[TEMP1_DATASET][:] if TEMP1_DATASET in grp else None,
-        grp[TEMP2_DATASET][:] if TEMP2_DATASET in grp else None,
-    )
+def read_temperature_channels(grp) -> "list[tuple[int, np.ndarray]]":
+    """All (k, samples) thermocouple datasets in a cycle group, by TC number."""
+    found = []
+    for key in grp:
+        m = _TEMP_DATASET_RE.fullmatch(key)
+        if m:
+            found.append((int(m.group(1)), grp[key][:]))
+    return sorted(found)
 
 
 def read_force_lbf(grp) -> "np.ndarray | None":

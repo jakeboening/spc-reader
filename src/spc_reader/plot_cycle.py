@@ -25,17 +25,16 @@ from .spc_io import (
     DISPLACEMENT_DATASET,
     FORCE_DATASET,
     LBF_TO_N,
-    TEMP1_DATASET,
-    TEMP2_DATASET,
     read_force_n,
-    read_temperatures_c,
+    read_temperature_channels,
+    temp_dataset,
     try_read_displacement_mm,
 )
 
 DISP_COLOR = "#eb6834"   # orange — displacement series (matches plot_live)
 FORCE_COLOR = "#2a78d6"  # blue — force series (matches plot_live)
-TEMP1_COLOR = "#9333ea"  # purple — thermocouple 1 (matches plot_live)
-TEMP2_COLOR = "#0d9488"  # teal — thermocouple 2 (matches plot_live)
+# Thermocouple palette, cycled by TC number (matches plot_live).
+TEMP_COLORS = ("#9333ea", "#0d9488", "#db2777", "#65a30d", "#b45309", "#64748b")
 
 
 def load_channels(grp, meta: dict) -> list[dict]:
@@ -63,14 +62,16 @@ def load_channels(grp, meta: dict) -> list[dict]:
                 FORCE_COLOR, force_n,
             )],
         })
-    t1, t2 = read_temperatures_c(grp)
     temp_series = []
-    if t1 is not None and len(t1):
-        temp_series.append((TEMP1_DATASET, meta.get("temp_ch1_name", "TC1"),
-                            TEMP1_COLOR, t1))
-    if t2 is not None and len(t2):
-        temp_series.append((TEMP2_DATASET, meta.get("temp_ch2_name", "TC2"),
-                            TEMP2_COLOR, t2))
+    for k, arr in read_temperature_channels(grp):
+        if not len(arr):
+            continue
+        temp_series.append((
+            temp_dataset(k),
+            meta.get(f"temp_ch{k}_name", f"TC{k}"),
+            TEMP_COLORS[(k - 1) % len(TEMP_COLORS)],
+            arr,
+        ))
     if temp_series:
         channels.append({
             # Autoscale on read-back — exploration beats fixed limits here.

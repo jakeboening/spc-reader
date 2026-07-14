@@ -55,18 +55,18 @@ from .spc_io import (
     DISPLACEMENT_DATASET,
     FORCE_COUNTS_DATASET,
     FORCE_DATASET,
-    TEMP1_DATASET,
-    TEMP2_DATASET,
     Reading,
     SPCChannel,
     auto_port,
     format_device_list,
     open_channel,
+    temp_dataset,
 )
 from .yocto_io import (
+    TEMP_FUNCTIONS,
     TemperatureChannel,
     format_temperature_device_list,
-    open_temperature_channel,
+    open_temperature_channels,
     to_c,
 )
 
@@ -74,8 +74,9 @@ MODES = ("force", "displacement", "temperature")
 
 DISP_COLOR = "#eb6834"   # orange — displacement series
 FORCE_COLOR = "#2a78d6"  # blue — force series
-TEMP1_COLOR = "#9333ea"  # purple — thermocouple 1
-TEMP2_COLOR = "#0d9488"  # teal — thermocouple 2
+# Thermocouple palette, cycled TC1, TC2, ... across however many modules are
+# connected; hues chosen to stay distinct from the orange/blue above.
+TEMP_COLORS = ("#9333ea", "#0d9488", "#db2777", "#65a30d", "#b45309", "#64748b")
 SURFACE = "#fcfcfb"      # window background
 PANEL = "#ffffff"        # plot area
 INK = "#1c1917"          # primary text
@@ -338,10 +339,11 @@ def parse_args():
                    help="Temperature Y-axis min")
     p.add_argument("--tmax", type=float, default=800.0, metavar="C",
                    help="Temperature Y-axis max")
-    p.add_argument("--temp-serial", default=None, metavar="SERIAL",
-                   help="Pin the Yocto-Thermocouple module serial (default: "
-                        "auto-discover; with a pin, startup proceeds even if "
-                        "the module is offline)")
+    p.add_argument("--temp-serial", action="append", default=None, metavar="SERIAL",
+                   help="Pin Yocto-Thermocouple module serial(s); repeatable, "
+                        "order sets TC numbering (default: all discovered "
+                        "modules; with a pin, startup proceeds even if the "
+                        "module is offline)")
     p.add_argument("--temp-ch1-name", default="TC1", metavar="NAME",
                    help="Thermocouple 1 legend")
     p.add_argument("--temp-ch2-name", default="TC2", metavar="NAME",
@@ -497,16 +499,17 @@ def main():
             except OSError as exc:
                 sys.exit(f"Could not open Mark-10 on {force_port!r}: {exc}")
 
-    temp_ch: TemperatureChannel | None = None
+    temp_chs: list[TemperatureChannel] = []
     if "temperature" in mode_names:
         try:
-            temp_ch = open_temperature_channel(
-                ports["temperature"] or "usb", serial=args.temp_serial
+            temp_chs = open_temperature_channels(
+                ports["temperature"] or "usb", serials=args.temp_serial
             )
         except OSError as exc:
             print(format_temperature_device_list(), file=sys.stderr)
             sys.exit(str(exc))
-        print(f"  Temperature: Yocto-Thermocouple {temp_ch.serial} via {temp_ch.port}")
+        for tch in temp_chs:
+            print(f"  Temperature: Yocto-Thermocouple {tch.serial} via {tch.port}")
 
     # In load cell mode the force channel counts as present even while the
     # adapter is unplugged — datasets/axes are created up front and samples
@@ -567,16 +570,26 @@ def main():
                 "load cell force" if is_loadcell else "Mark-10 force"
             )
         else:  # temperature
-            modes.append(Mode(name, UNIT_C, TEMP1_COLOR, (args.tmin, args.tmax), [
-                make_series(TEMP1_DATASET, args.temp_ch1_name, TEMP1_COLOR, 1),
-                make_series(TEMP2_DATASET, args.temp_ch2_name, TEMP2_COLOR, 1),
-            ]))
-            log_columns.append((TEMP1_DATASET, "f4"))
-            log_columns.append((TEMP2_DATASET, "f4"))
-            log_attrs["temp_serial"] = temp_ch.serial
+            # TC numbering is continuous across modules: module i (0-based)
+            # contributes TC 2i+1 and 2i+2 on the shared temperature axis.
+            temp_series: list[Series] = []
+            log_attrs["temp_serial"] = ",".join(t.serial for t in temp_chs)
             log_attrs["temp_units"] = "C"
-            log_attrs["temp_ch1_name"] = args.temp_ch1_name
-            log_attrs["temp_ch2_name"] = args.temp_ch2_name
+            k = 0
+            for tch in temp_chs:
+                for _fn in TEMP_FUNCTIONS:
+                    k += 1
+                    key = temp_dataset(k)
+                    label = {1: args.temp_ch1_name, 2: args.temp_ch2_name}.get(
+                        k, f"TC{k}"
+                    )
+                    color = TEMP_COLORS[(k - 1) % len(TEMP_COLORS)]
+                    temp_series.append(make_series(key, label, color, 1))
+                    log_columns.append((key, "f4"))
+                    log_attrs[f"temp_ch{k}_name"] = label
+                    log_attrs[f"temp_ch{k}_serial"] = tch.serial
+            modes.append(Mode(name, UNIT_C, temp_series[0].color,
+                              (args.tmin, args.tmax), temp_series))
             title_parts.append("thermocouple temperature")
 
     all_series = [(m, s) for m in modes for s in m.series]
@@ -921,7 +934,10 @@ def main():
     # Whether any channel besides the hot-pluggable load cell produces samples;
     # with none, the sampler idles instead of logging all-NaN rows while the
     # adapter is absent.
-    other_readers = ch is not None or temp_ch is not None
+    other_readers = ch is not None or bool(temp_chs)
+    # Dataset keys per temperature channel, in module order (TC 2i+1, 2i+2).
+    temp_keys = [(temp_dataset(2 * i + 1), temp_dataset(2 * i + 2))
+                 for i in range(len(temp_chs))]
 
     def sampler_loop() -> None:
         """Read the (slow, blocking) channels off the GUI thread."""
@@ -950,10 +966,8 @@ def main():
             values: dict[str, float | None] = {}
             if ch is not None:
                 values[DISPLACEMENT_DATASET] = poll_channel(ch)
-            if temp_ch is not None:
-                t1, t2 = poll_temperature(temp_ch)
-                values[TEMP1_DATASET] = t1
-                values[TEMP2_DATASET] = t2
+            for tch, (key1, key2) in zip(temp_chs, temp_keys):
+                values[key1], values[key2] = poll_temperature(tch)
             if fch is not None:
                 reading = None
                 read_exc: OSError | None = None
@@ -1281,7 +1295,7 @@ def main():
         if sampler.is_alive():
             print("  Warning: sampler thread still busy at exit.", file=sys.stderr)
         logger.close()
-        for c in (ch, force["ch"], temp_ch):
+        for c in (ch, force["ch"], *temp_chs):
             if c is not None:
                 try:
                     c.close()

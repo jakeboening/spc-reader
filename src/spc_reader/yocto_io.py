@@ -21,6 +21,8 @@ TEMP_FUNCTIONS = ("temperature1", "temperature2")
 # While a sensor is offline, re-scan the device list at most this often so a
 # module plugged in (or back in) mid-session comes online without a restart.
 _DEVLIST_MIN_S = 2.0
+# YAPI is process-global; free it once no matter how many channels close.
+_api_freed = False
 
 
 def _yocto():
@@ -128,30 +130,36 @@ class TemperatureChannel:
             pass
 
     def close(self) -> None:
+        global _api_freed
+        if _api_freed:
+            return
+        _api_freed = True
         try:
             self._YAPI.FreeAPI()
         except self._YAPI_Exception:
             pass
 
 
-def open_temperature_channel(
-    port: str = "usb", serial: str | None = None
-) -> TemperatureChannel:
-    """Connect to the hub and bind one module's thermocouple inputs.
+def open_temperature_channels(
+    port: str = "usb", serials: list[str] | None = None
+) -> list[TemperatureChannel]:
+    """Connect to the hub and bind every module's thermocouple inputs.
 
-    A pinned ``serial`` proceeds even if the module is currently offline
-    (readings start when it appears); auto-discovery requires one online module.
+    With pinned ``serials``, exactly those modules are bound in that order,
+    even if currently offline (readings start when each appears). Otherwise
+    all discovered modules are bound; at least one must be online.
     """
     target = hub_target(port)
     register_hub(target)
     found = discover_temperature_modules()
-    if serial:
-        if serial not in found:
-            print(
-                f"  {serial} is not online yet — readings start when it appears.",
-                file=sys.stderr,
-            )
-        return TemperatureChannel(target, serial)
+    if serials:
+        for serial in serials:
+            if serial not in found:
+                print(
+                    f"  {serial} is not online yet — readings start when it appears.",
+                    file=sys.stderr,
+                )
+        return [TemperatureChannel(target, serial) for serial in serials]
     if not found:
         raise OSError(
             f"No Yocto-Thermocouple found on {target!r}.\n"
@@ -159,13 +167,7 @@ def open_temperature_channel(
             "VirtualHub if it is running), pass --port temperature=HOST:PORT "
             "for a hub, or pin --temp-serial to start before plugging in."
         )
-    if len(found) > 1:
-        print(
-            f"  Multiple Yoctopuce temperature modules ({', '.join(found)}) — "
-            f"using {found[0]}; pin another with --temp-serial.",
-            file=sys.stderr,
-        )
-    return TemperatureChannel(target, found[0])
+    return [TemperatureChannel(target, serial) for serial in found]
 
 
 def to_c(reading: Reading | None) -> float:

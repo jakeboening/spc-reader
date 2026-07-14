@@ -169,7 +169,7 @@ Load cell ── 4-wire ── RS485 transmitter ── USB-RS485 adapter ──
 
 USB-ITN appears as USB `0fe7:4001` and is read via **pyusb** (not a tty). The Mark-10 exposes a virtual COM port (`/dev/ttyUSB*` or `/dev/ttyACM*`). An RS485 load cell transmitter connects through a USB-RS485 adapter on `/dev/ttyUSB*` (macOS: `/dev/cu.usbserial-*`, Windows: `COMx`).
 
-The Yocto-Thermocouple is read via the **yoctopuce** library, by default directly over USB (`--port temperature=usb`) — note direct USB needs exclusive access, so quit VirtualHub if it is running. Passing `--port temperature=HOST:PORT` connects to a VirtualHub/YoctoHub instead. Both thermocouple inputs are logged; an input with no probe (or an unplugged module) records NaN.
+The Yocto-Thermocouple is read via the **yoctopuce** library, by default directly over USB (`--port temperature=usb`) — note direct USB needs exclusive access, so quit VirtualHub if it is running. Passing `--port temperature=HOST:PORT` connects to a VirtualHub/YoctoHub instead. **All connected modules are plotted automatically** — each contributes two lines (TC1, TC2, TC3, … numbered across modules in discovery order); `--temp-serial` (repeatable) pins specific modules and sets their order. An input with no probe (or an unplugged module) records NaN. Modules must be present (or pinned) at startup to be included.
 
 On the Mark-10: open **Serial/USB Settings**, select **USB**, set baud to **115200** (match `--force-baud`) and **Numeric + Units** data format. The gauge must be on the main measurement screen (not a menu) for GCL2 commands.
 
