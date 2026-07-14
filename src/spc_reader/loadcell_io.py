@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -275,6 +276,27 @@ class RawCalibration:
         return (raw - self.zero_counts) / self.counts_per_kg
 
 
+def normalize_port(port: str) -> str:
+    """Canonical serial port name (Windows COM names are case-insensitive)."""
+    if sys.platform == "win32" and re.fullmatch(r"com\d+", port, re.IGNORECASE):
+        return port.upper()
+    return port
+
+
+def port_present(port: str) -> bool:
+    """Whether ``port`` currently exists (COM name on Windows, device node elsewhere)."""
+    if sys.platform != "win32":
+        return os.path.exists(port)
+    # COM names are not filesystem paths (COM1–COM9 are reserved DOS device
+    # names and COM10+ need a \\.\ prefix), so ask pyserial instead.
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return True  # cannot enumerate; let open() decide
+    want = port.upper()
+    return any(info.device.upper() == want for info in list_ports.comports())
+
+
 def default_cal_path() -> str:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return os.path.join(base, "spc-reader", "loadcell_cal.json")
@@ -282,6 +304,7 @@ def default_cal_path() -> str:
 
 def load_calibration(port: str, *, path: str | None = None) -> RawCalibration | None:
     """Load a saved raw-ADC calibration for ``port`` (falls back to a ``default`` entry)."""
+    port = normalize_port(port)
     path = path or default_cal_path()
     try:
         with open(path) as f:
@@ -307,6 +330,7 @@ def save_calibration(
     path: str | None = None,
 ) -> str:
     """Persist ``cal`` for ``port`` into the JSON config, returning the file path."""
+    port = normalize_port(port)
     path = path or default_cal_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
@@ -533,8 +557,8 @@ def format_loadcell_device_list() -> str:
     ports = list_rs485_ports()
     if not ports:
         lines.append(
-            "  (no /dev/ttyUSB*, /dev/ttyACM*, or /dev/cu.usbserial-* found — "
-            "plug in USB-RS485 adapter)"
+            "  (no /dev/ttyUSB*, /dev/ttyACM*, /dev/cu.usbserial-*, or USB COMx "
+            "found — plug in USB-RS485 adapter)"
         )
     else:
         for path, label in ports:
@@ -544,7 +568,7 @@ def format_loadcell_device_list() -> str:
         f"Load cell ranges: {range_choices()}",
         "",
         "Use:  spc-plot --force-type loadcell --force-port /dev/ttyUSB0 --loadcell-range 100kg",
-        "      (macOS: --force-port /dev/cu.usbserial-XXXX)",
+        "      (macOS: --force-port /dev/cu.usbserial-XXXX, Windows: --force-port COM5)",
         "Probe:  spc-loadcell-probe --port /dev/ttyUSB0",
     ])
     return "\n".join(lines)

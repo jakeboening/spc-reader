@@ -30,8 +30,10 @@ from .loadcell_io import (
     default_cal_path,
     format_loadcell_device_list,
     load_calibration,
+    normalize_port,
     open_loadcell_channel,
     parse_loadcell_range,
+    port_present,
     range_choices,
 )
 from .mark10_io import (
@@ -275,7 +277,8 @@ def parse_args():
     p.add_argument("--ch-name", default="SPC", metavar="NAME", help="Displacement legend")
     p.add_argument("--tag", default="", help="Free-text label for this cycle")
     p.add_argument("--force-port", metavar="PATH",
-                   help="Force sensor port: Mark-10 USB or RS485 adapter (/dev/tty*)")
+                   help="Force sensor port: Mark-10 USB or RS485 adapter "
+                        "(/dev/tty*, or COMx on Windows)")
     p.add_argument("--force-type", choices=("mark10", "loadcell"), default="mark10",
                    help="Force sensor backend")
     p.add_argument("--no-force", action="store_true",
@@ -333,6 +336,9 @@ def main():
         print(format_loadcell_device_list())
         return
 
+    if args.force_port:
+        args.force_port = normalize_port(args.force_port)
+
     if args.force_baud is None:
         args.force_baud = 9600 if args.force_type == "loadcell" else 115200
 
@@ -374,7 +380,8 @@ def main():
             if not args.force_port:
                 sys.exit(
                     "Load cell mode requires --force-port (RS485 USB adapter, "
-                    "e.g. /dev/ttyUSB0 or /dev/cu.usbserial-XXXX on macOS).\n"
+                    "e.g. /dev/ttyUSB0, /dev/cu.usbserial-XXXX on macOS, "
+                    "or COM5 on Windows).\n"
                     f"Ranges: {range_choices()}"
                 )
             try:
@@ -813,7 +820,7 @@ def main():
 
     def connect_force() -> ForceChannel | None:
         """Try to (re)open the load cell; None while it is absent/unresponsive."""
-        if not os.path.exists(args.force_port):
+        if not port_present(args.force_port):
             return None
         try:
             fch = open_loadcell_channel(
@@ -878,7 +885,7 @@ def main():
                 except OSError as exc:
                     read_exc = exc
                 if (force_expected and reading is None
-                        and not os.path.exists(fch.port)):
+                        and not port_present(fch.port)):
                     # Port node vanished: the adapter was unplugged. Drop the
                     # channel and fall back to waiting for it to reappear.
                     try:
