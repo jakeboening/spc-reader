@@ -922,13 +922,20 @@ def main():
             label_box["saved"] = logger.label
             update_dirty_indicator()
 
+    # Whichever exit path fires first records why; teardown reports it once.
+    exit_reason = {"why": None}
+
+    def note_exit(why: str) -> None:
+        if exit_reason["why"] is None:
+            exit_reason["why"] = why
+
     def on_key(event):
         # Ignore keys (incl. "t"/"s"/"q") while the user is typing in the label field.
         w = label_box["widget"]
         if w is not None and getattr(w, "capturekeystrokes", False):
             return
         if event.key == "q":
-            print("  Quit (q).")
+            note_exit("quit key (q)")
             plt.close(fig)
             return
         if event.key == "s":
@@ -1350,18 +1357,53 @@ def main():
         # the serial port open — killing it then wedges the FTDI driver until
         # the adapter is replugged (open() fails with termios EINVAL).
         closing["on"] = True   # queued callbacks must not touch the dying canvas
+        note_exit("window closed")
         timer.stop()
         stop_evt.set()
 
     fig.canvas.mpl_connect("close_event", on_close)
 
-    # If the process dies by signal (closed terminal → SIGHUP, kill → SIGTERM,
-    # Ctrl+Break on Windows → SIGBREAK), exit via SystemExit so the finally
-    # block below still closes the port. Not every signal exists per platform.
+    teardown_done = {"v": False}
+
+    def teardown() -> None:
+        """Flush the log, release devices, report the exit. Idempotent —
+        called from the finally block AND from signal handlers, because a
+        SystemExit raised inside a backend event-loop callback kills the
+        process without ever unwinding plt.show()."""
+        if teardown_done["v"]:
+            return
+        teardown_done["v"] = True
+        closing["on"] = True
+        timer.stop()
+        stop_evt.set()
+        sampler.join(timeout=5.0)
+        if sampler.is_alive():
+            print("  Warning: sampler thread still busy at exit.", file=sys.stderr)
+        try:
+            logger.close()
+        except Exception as exc:  # e.g. a signal landed mid-flush
+            print(f"  Warning: final log flush failed: {exc}", file=sys.stderr)
+        for c in (ch, force["ch"], *temp_chs):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+        print(f"  Exit: {exit_reason['why'] or 'display loop ended'}")
+        print(f"  Log saved: {_display_path(data_file)}  "
+              f"[cycles/{logger.cycle_name}]", flush=True)
+
+    # On a fatal signal (closed terminal → SIGHUP, kill → SIGTERM, Ctrl+Break
+    # on Windows → SIGBREAK), run teardown directly, then exit. Not every
+    # signal exists on every platform.
     for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
         _sig = getattr(signal, _name, None)
         if _sig is not None:
-            signal.signal(_sig, lambda *_a: sys.exit(1))
+            def _on_signal(*_a, _n=_name):
+                note_exit(f"signal {_n}")
+                teardown()
+                sys.exit(1)
+            signal.signal(_sig, _on_signal)
 
     fig.canvas.draw()      # realize a renderer so the bar contents can be measured
     layout_bar()
@@ -1370,19 +1412,10 @@ def main():
     timer.start()
     try:
         plt.show()
+    except KeyboardInterrupt:
+        note_exit("keyboard interrupt (Ctrl+C)")
     finally:
-        timer.stop()
-        stop_evt.set()
-        sampler.join(timeout=5.0)
-        if sampler.is_alive():
-            print("  Warning: sampler thread still busy at exit.", file=sys.stderr)
-        logger.close()
-        for c in (ch, force["ch"], *temp_chs):
-            if c is not None:
-                try:
-                    c.close()
-                except OSError:
-                    pass
+        teardown()
 
 
 if __name__ == "__main__":
