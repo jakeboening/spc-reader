@@ -567,8 +567,10 @@ def format_loadcell_device_list() -> str:
         "",
         f"Load cell ranges: {range_choices()}",
         "",
-        "Use:  spc-plot --force-type loadcell --force-port /dev/ttyUSB0 --loadcell-range 100kg",
-        "      (macOS: --force-port /dev/cu.usbserial-XXXX, Windows: --force-port COM5)",
+        "Use:  spc-plot --mode force --force-type loadcell "
+        "--port force=/dev/ttyUSB0 --loadcell-range 100kg",
+        "      (macOS: --port force=/dev/cu.usbserial-XXXX, "
+        "Windows: --port force=COM5)",
         "Probe:  spc-loadcell-probe --port /dev/ttyUSB0",
     ])
     return "\n".join(lines)

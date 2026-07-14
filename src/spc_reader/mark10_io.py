@@ -118,7 +118,7 @@ def format_force_device_list() -> str:
         for d in ports:
             lines.append(f"  {d.path}  serial={d.serial!r}  {d.product}")
     lines.append("")
-    lines.append("Use:  --force-port /dev/ttyUSB0")
+    lines.append("Use:  spc-plot --mode force   (auto-detects; or --port force=/dev/ttyUSB0)")
     return "\n".join(lines)
 
 

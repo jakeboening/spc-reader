@@ -22,6 +22,10 @@ UNITS = {0: "mm", 1: "in"}
 DISPLACEMENT_DATASET = "displacement_mm"
 FORCE_DATASET = "force_n"
 FORCE_COUNTS_DATASET = "force_counts"
+# The "_c" suffix is load-bearing: bare "temperature1" is a legacy alias for
+# displacement (see _LEGACY_DISPLACEMENT_KEYS) and must stay distinct.
+TEMP1_DATASET = "temperature1_c"
+TEMP2_DATASET = "temperature2_c"
 LBF_TO_N = 4.4482216152605
 DEFAULT_LOG_FILENAME = "force_and_displacement.h5"
 # Legacy log filenames (still readable via --data-file):
@@ -248,6 +252,14 @@ def read_force_n(grp) -> "np.ndarray | None":
     return None
 
 
+def read_temperatures_c(grp) -> "tuple[np.ndarray | None, np.ndarray | None]":
+    """(temperature1_c, temperature2_c) arrays; None per missing channel."""
+    return (
+        grp[TEMP1_DATASET][:] if TEMP1_DATASET in grp else None,
+        grp[TEMP2_DATASET][:] if TEMP2_DATASET in grp else None,
+    )
+
+
 def read_force_lbf(grp) -> "np.ndarray | None":
     """Legacy helper: force in lbf (converts from ``force_n`` if needed)."""
     n = read_force_n(grp)
@@ -288,7 +300,8 @@ def format_device_list() -> str:
     lines.append("  eth0 — DisplayLink Humanscale M-Connect 2 USB dock Ethernet")
     lines.append("  enp0s31f6 — built-in Ethernet (no cable)")
     lines.append("")
-    lines.append("Use:  --port usb-itn   (or the path shown above)")
+    lines.append("Use:  spc-plot --mode displacement   "
+                 "(auto-detects; or --port displacement=usb-itn)")
     return "\n".join(lines)
 
 

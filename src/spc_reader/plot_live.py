@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Real-time Mitutoyo displacement + Mark-10 force plotter and HDF5 logger."""
+"""Real-time multi-mode plotter and HDF5 logger.
+
+Modes (one y-axis each, any combination): displacement (Mitutoyo SPC),
+force (Mark-10 or RS485 load cell), temperature (Yoctopuce thermocouple).
+"""
 
 import argparse
 import collections
 import datetime
 import os
 import queue
+import re
 import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 from . import mpl_setup  # noqa: F401  # before matplotlib.pyplot
 
@@ -29,6 +35,7 @@ from .loadcell_io import (
     capacity_n,
     default_cal_path,
     format_loadcell_device_list,
+    list_rs485_ports,
     load_calibration,
     normalize_port,
     open_loadcell_channel,
@@ -48,15 +55,27 @@ from .spc_io import (
     DISPLACEMENT_DATASET,
     FORCE_COUNTS_DATASET,
     FORCE_DATASET,
+    TEMP1_DATASET,
+    TEMP2_DATASET,
     Reading,
     SPCChannel,
     auto_port,
     format_device_list,
     open_channel,
 )
+from .yocto_io import (
+    TemperatureChannel,
+    format_temperature_device_list,
+    open_temperature_channel,
+    to_c,
+)
+
+MODES = ("force", "displacement", "temperature")
 
 DISP_COLOR = "#eb6834"   # orange — displacement series
 FORCE_COLOR = "#2a78d6"  # blue — force series
+TEMP1_COLOR = "#9333ea"  # purple — thermocouple 1
+TEMP2_COLOR = "#0d9488"  # teal — thermocouple 2
 SURFACE = "#fcfcfb"      # window background
 PANEL = "#ffffff"        # plot area
 INK = "#1c1917"          # primary text
@@ -68,6 +87,7 @@ WARN = "#b54708"         # sensor-disconnected banner
 REC_GREEN = "#067647"    # recording chip
 UNIT_MM = "mm"
 UNIT_N = "N"
+UNIT_C = "°C"
 # M5-10 full scale: 10 lbf ≈ 44.5 N
 DEFAULT_FORCE_MAX_N = 10 * 4.4482216152605
 # Load cell default view: positive-only, 0 → 250 N.
@@ -88,46 +108,55 @@ def to_mm(reading: Reading | None) -> float:
     return reading.value
 
 
+@dataclass
+class Series:
+    """One plotted line; ``key`` doubles as HDF5 dataset name and sample-dict key."""
+    key: str
+    label: str
+    color: str
+    decimals: int            # readout/hover precision
+    line: object = None      # Line2D, set when the axes are built
+    vals: collections.deque = field(default_factory=collections.deque)
+
+
+@dataclass
+class Mode:
+    """One measurement kind, owning a y-axis and its line series."""
+    name: str
+    unit: str
+    axis_color: str          # y-axis tint when several modes share the plot
+    ylim: tuple
+    series: list
+    ax: object = None        # Axes, set when the figure is built
+
+
 class DataLogger:
-    """Buffers and flushes (time, displacement_mm[, force_n]) to HDF5."""
+    """Buffers and flushes time + per-channel sample columns to HDF5."""
 
     FLUSH_EVERY = 25
 
     def __init__(
         self,
         filepath: str,
-        device_id: str,
         hz: float,
         tag: str,
-        ch_name: str,
         *,
-        log_displacement: bool = True,
-        log_force: bool = False,
-        force_device_id: str = "",
-        force_ch_name: str = "Force",
-        force_capacity_n: float | None = None,
-        log_counts: bool = False,
-        force_cal: RawCalibration | None = None,
+        columns: list[tuple[str, str]],
+        attrs: dict | None = None,
     ):
-        if not log_displacement and not log_force:
-            raise ValueError("DataLogger needs at least one channel")
+        """``columns`` are (dataset_name, dtype) pairs, excluding ``time``;
+        ``attrs`` are extra cycle-group attributes."""
+        if not columns:
+            raise ValueError("DataLogger needs at least one column")
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         self._path = filepath
-        self._device_id = device_id
         self._hz = hz
         self._tag = tag
-        self._ch_name = ch_name
-        self._log_displacement = log_displacement
-        self._log_force = log_force
-        self._force_device_id = force_device_id
-        self._force_ch_name = force_ch_name
-        self._force_capacity_n = force_capacity_n
-        self._log_counts = log_counts and log_force
-        self._force_cal = force_cal
-        self._buf_t: list[float] = []
-        self._buf_mm: list[float] = []
-        self._buf_n: list[float] = []
-        self._buf_counts: list[float] = []
+        self._columns = list(columns)
+        self._attrs = dict(attrs or {})
+        self._buf: dict[str, list[float]] = {
+            name: [] for name in ("time", *(c[0] for c in self._columns))
+        }
         self._start_cycle()
 
     def _start_cycle(self) -> None:
@@ -140,32 +169,9 @@ class DataLogger:
             grp.attrs["label"]     = ""
             grp.attrs["hz"]        = self._hz
             grp.attrs["start_iso"] = datetime.datetime.now().isoformat()
-            if self._log_displacement:
-                grp.attrs["serial"]       = self._device_id
-                grp.attrs["units"]        = UNIT_MM
-                grp.attrs["channel_name"] = self._ch_name
-            if self._log_force:
-                grp.attrs["force_serial"]       = self._force_device_id
-                grp.attrs["force_units"]        = UNIT_N
-                grp.attrs["force_channel_name"] = self._force_ch_name
-                if self._force_capacity_n is not None:
-                    grp.attrs["force_capacity_n"] = self._force_capacity_n
-            if self._log_counts:
-                grp.attrs["force_counts_source"] = "raw ADC (registers 40015/16)"
-                if self._force_cal is not None:
-                    grp.attrs["force_cal_source"]        = "raw-adc"
-                    grp.attrs["force_cal_zero_counts"]   = self._force_cal.zero_counts
-                    grp.attrs["force_cal_counts_per_kg"] = self._force_cal.counts_per_kg
-                else:
-                    grp.attrs["force_cal_source"] = "scaled-register"
-            datasets: list[tuple[str, str]] = [("time", "f8")]
-            if self._log_displacement:
-                datasets.append((DISPLACEMENT_DATASET, "f4"))
-            if self._log_force:
-                datasets.append((FORCE_DATASET, "f4"))
-            if self._log_counts:
-                datasets.append((FORCE_COUNTS_DATASET, "f8"))
-            for ds_name, dtype in datasets:
+            for key, val in self._attrs.items():
+                grp.attrs[key] = val
+            for ds_name, dtype in [("time", "f8"), *self._columns]:
                 grp.create_dataset(
                     ds_name, shape=(0,), maxshape=(None,),
                     dtype=dtype, chunks=(256,), compression="gzip",
@@ -202,25 +208,13 @@ class DataLogger:
         self._start_cycle()
         return self._grp_path
 
-    def append(
-        self,
-        unix_t: float,
-        displacement_mm: float | None = None,
-        force_n: float | None = None,
-        force_counts: float | None = None,
-    ) -> None:
-        self._buf_t.append(unix_t)
-        if self._log_displacement:
-            self._buf_mm.append(
-                displacement_mm if displacement_mm is not None else float("nan")
-            )
-        if self._log_force:
-            self._buf_n.append(force_n if force_n is not None else float("nan"))
-        if self._log_counts:
-            self._buf_counts.append(
-                float(force_counts) if force_counts is not None else float("nan")
-            )
-        if len(self._buf_t) >= self.FLUSH_EVERY:
+    def append(self, unix_t: float, values: dict[str, float | None]) -> None:
+        """Buffer one sample row; keys missing from ``values`` log as NaN."""
+        self._buf["time"].append(unix_t)
+        for name, _dtype in self._columns:
+            v = values.get(name)
+            self._buf[name].append(float(v) if v is not None else float("nan"))
+        if len(self._buf["time"]) >= self.FLUSH_EVERY:
             self._flush()
 
     def flush(self) -> None:
@@ -231,58 +225,88 @@ class DataLogger:
         self._flush()
 
     def _flush(self) -> None:
-        if not self._buf_t:
+        if not self._buf["time"]:
             return
-        t_data = self._buf_t[:]
-        self._buf_t.clear()
-        pairs: list[tuple[str, list]] = [("time", t_data)]
-        if self._log_displacement:
-            mm_data = self._buf_mm[:]
-            self._buf_mm.clear()
-            pairs.append((DISPLACEMENT_DATASET, mm_data))
-        if self._log_force:
-            n_data = self._buf_n[:]
-            self._buf_n.clear()
-            pairs.append((FORCE_DATASET, n_data))
-        if self._log_counts:
-            counts_data = self._buf_counts[:]
-            self._buf_counts.clear()
-            pairs.append((FORCE_COUNTS_DATASET, counts_data))
         with h5py.File(self._path, "a") as f:
             grp = f[self._grp_path]
-            for ds_name, data in pairs:
+            for ds_name, data in self._buf.items():
                 ds = grp[ds_name]
                 n = len(ds)
                 ds.resize(n + len(data), axis=0)
                 ds[n:] = data
+                data.clear()
+
+
+def resolve_ports(p: argparse.ArgumentParser, modes: list[str],
+                  port_args: list[str]) -> dict[str, str | None]:
+    """Map --port entries onto active modes; None means auto-detect.
+
+    Entries are ``MODE=VALUE`` or a bare ``VALUE`` (allowed once, binding to
+    the only active mode without an explicit port). A ``word=`` prefix that
+    isn't a mode name is rejected; values containing ``=`` for other reasons
+    (paths, serials) pass through as bare values.
+    """
+    ports: dict[str, str | None] = {m: None for m in modes}
+    bare: list[str] = []
+    for entry in port_args:
+        mode, sep, value = entry.partition("=")
+        if sep and mode in MODES:
+            if mode not in ports:
+                p.error(f"--port {entry}: mode {mode!r} is not in --mode")
+            if ports[mode] is not None:
+                p.error(f"--port: duplicate port for mode {mode!r}")
+            if not value:
+                p.error(f"--port {entry}: empty port value")
+            ports[mode] = value
+        elif sep and re.fullmatch(r"[a-z]+", mode):
+            p.error(f"--port {entry}: unknown mode {mode!r} "
+                    f"(choose from {', '.join(MODES)})")
+        else:
+            bare.append(entry)
+    if len(bare) > 1:
+        p.error("--port: at most one bare value; use --port MODE=VALUE")
+    if bare:
+        unassigned = [m for m in modes if ports[m] is None]
+        if not unassigned:
+            p.error(f"--port {bare[0]}: every mode already has a port")
+        if len(unassigned) > 1:
+            p.error(f"--port {bare[0]} is ambiguous with modes "
+                    f"{', '.join(unassigned)}; use --port MODE=VALUE")
+        ports[unassigned[0]] = bare[0]
+    return ports
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Mitutoyo SPC displacement and force logger (Mark-10 or RS485 load cell) with live plotting",
+        description="Displacement (Mitutoyo SPC), force (Mark-10 or RS485 load cell), "
+                    "and temperature (Yoctopuce thermocouple) logger with live plotting",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--port", metavar="PATH",
-                   help="usb-itn, usb-itn:SERIAL, or /dev/tty* (default: auto)")
-    p.add_argument("--no-displacement", action="store_true",
-                   help="Force only (skip Mitutoyo displacement channel)")
-    p.add_argument("--baud", type=int, default=9600)
+    p.add_argument("--mode", nargs="+", choices=MODES, metavar="MODE",
+                   help="Channels to plot/log: force, displacement, temperature. "
+                        "The first mode owns the left y-axis; each further mode "
+                        "adds its own y-axis on the right.")
+    p.add_argument("--port", action="append", default=[], metavar="[MODE=]VALUE",
+                   help="Port for a mode, e.g. --port force=COM5 --port temperature=usb. "
+                        "Repeatable; a bare VALUE binds to the only portless mode; "
+                        "omitted ports auto-detect. Displacement: usb-itn[:SERIAL] "
+                        "or serial port; force: serial port; temperature: usb or "
+                        "HOST:PORT of a VirtualHub/YoctoHub.")
+    p.add_argument("--baud", type=int, default=9600,
+                   help="Displacement serial baud")
     p.add_argument("--list-ports", action="store_true",
-                   help="List Mitutoyo and Mark-10 devices and exit")
+                   help="List Mitutoyo, Mark-10, RS485, and Yoctopuce devices and exit")
     p.add_argument("--device-id", default="SPC", metavar="ID")
     p.add_argument("--window", type=float, default=600, metavar="SECS")
-    p.add_argument("--ymin", type=float, default=0, metavar="MM")
-    p.add_argument("--ymax", type=float, default=30, metavar="MM")
+    p.add_argument("--ymin", type=float, default=0, metavar="MM",
+                   help="Displacement Y-axis min")
+    p.add_argument("--ymax", type=float, default=30, metavar="MM",
+                   help="Displacement Y-axis max")
     p.add_argument("--hz", type=float, default=30, metavar="HZ")
     p.add_argument("--ch-name", default="SPC", metavar="NAME", help="Displacement legend")
     p.add_argument("--tag", default="", help="Free-text label for this cycle")
-    p.add_argument("--force-port", metavar="PATH",
-                   help="Force sensor port: Mark-10 USB or RS485 adapter "
-                        "(/dev/tty*, or COMx on Windows)")
     p.add_argument("--force-type", choices=("mark10", "loadcell"), default="mark10",
                    help="Force sensor backend")
-    p.add_argument("--no-force", action="store_true",
-                   help="Displacement only (skip force channel)")
     p.add_argument("--force-baud", type=int, default=None,
                    help="Serial baud (default: 115200 Mark-10, 9600 load cell)")
     p.add_argument("--force-id", default="M5", metavar="ID")
@@ -310,11 +334,31 @@ def parse_args():
     p.add_argument("--fmax", type=float, default=None, metavar="N",
                    help=f"Force Y-axis max (default: {DEFAULT_LOADCELL_MAX_N:g} for load cell, "
                         f"M5-10 full scale for Mark-10)")
+    p.add_argument("--tmin", type=float, default=0.0, metavar="C",
+                   help="Temperature Y-axis min")
+    p.add_argument("--tmax", type=float, default=800.0, metavar="C",
+                   help="Temperature Y-axis max")
+    p.add_argument("--temp-serial", default=None, metavar="SERIAL",
+                   help="Pin the Yocto-Thermocouple module serial (default: "
+                        "auto-discover; with a pin, startup proceeds even if "
+                        "the module is offline)")
+    p.add_argument("--temp-ch1-name", default="TC1", metavar="NAME",
+                   help="Thermocouple 1 legend")
+    p.add_argument("--temp-ch2-name", default="TC2", metavar="NAME",
+                   help="Thermocouple 2 legend")
     p.add_argument(
         "--data-file", default=default_log_path(), metavar="PATH",
         help=f"HDF5 log (default: {default_log_path()})",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.list_ports:
+        if not args.mode:
+            p.error("--mode is required (choose one or more of: "
+                    + ", ".join(MODES) + ")")
+        # Dedupe while keeping the user's axis order.
+        args.mode = list(dict.fromkeys(args.mode))
+        args.ports = resolve_ports(p, args.mode, args.port)
+    return args
 
 
 def poll_channel(ch: SPCChannel) -> float:
@@ -323,6 +367,15 @@ def poll_channel(ch: SPCChannel) -> float:
     except OSError as exc:
         print(f"  Read error on {ch.port}: {exc}", file=sys.stderr)
         return float("nan")
+
+
+def poll_temperature(tch: TemperatureChannel) -> tuple[float, float]:
+    try:
+        r1, r2 = tch.read()
+    except OSError as exc:
+        print(f"  Temperature read error on {tch.port}: {exc}", file=sys.stderr)
+        return float("nan"), float("nan")
+    return to_c(r1), to_c(r2)
 
 
 def main():
@@ -334,25 +387,25 @@ def main():
         print(format_force_device_list())
         print()
         print(format_loadcell_device_list())
+        print()
+        print(format_temperature_device_list())
         return
 
-    if args.force_port:
-        args.force_port = normalize_port(args.force_port)
+    mode_names: list[str] = args.mode
+    ports: dict[str, str | None] = args.ports
 
     if args.force_baud is None:
         args.force_baud = 9600 if args.force_type == "loadcell" else 115200
 
-    if args.no_displacement and args.no_force:
-        sys.exit("Need at least one channel (omit --no-displacement or --no-force).")
-
     ch: SPCChannel | None = None
-    if not args.no_displacement:
-        port = args.port or auto_port()
+    if "displacement" in mode_names:
+        port = ports["displacement"] or auto_port()
         if not port:
             print(format_device_list(), file=sys.stderr)
             sys.exit(
                 "No Mitutoyo device found.\n"
-                "Use --no-displacement for force-only, or install udev rules and replug USB-ITN."
+                "Connect USB-ITN (or give --port displacement=PATH); on Linux "
+                "install udev rules and replug."
             )
         try:
             ch = open_channel(port, baud=args.baud)
@@ -364,32 +417,37 @@ def main():
                 "  sudo udevadm control --reload && sudo udevadm trigger"
             )
         print(f"  Displacement port: {port}")
-    elif args.no_force:
-        print("  Displacement only (--no-force).")
-    else:
-        print("  Force only (--no-displacement).")
 
     force_ch: ForceChannel | None = None
     loadcell_range_kg: float | None = None
     raw_cal: RawCalibration | None = None
+    force_port: str | None = None
     # Load cell mode supports hot-plug: the channel may be absent at startup
     # (or unplugged mid-session) and is (re)connected by polling for the port.
     force_expected = False
-    if not args.no_force:
+    if "force" in mode_names:
         if args.force_type == "loadcell":
-            if not args.force_port:
-                sys.exit(
-                    "Load cell mode requires --force-port (RS485 USB adapter, "
-                    "e.g. /dev/ttyUSB0, /dev/cu.usbserial-XXXX on macOS, "
-                    "or COM5 on Windows).\n"
-                    f"Ranges: {range_choices()}"
-                )
+            force_port = ports["force"]
+            if not force_port:
+                candidates = list_rs485_ports()
+                if len(candidates) == 1:
+                    force_port = candidates[0][0]
+                    print(f"  RS485 adapter auto-detected: {force_port}")
+                else:
+                    print(format_loadcell_device_list(), file=sys.stderr)
+                    sys.exit(
+                        "Load cell mode needs a port (--port force=PATH): "
+                        + ("no RS485 adapter candidates found."
+                           if not candidates
+                           else "multiple candidates — pick one.")
+                    )
+            force_port = normalize_port(force_port)
             try:
                 loadcell_range_kg = parse_loadcell_range(args.loadcell_range)
             except ValueError as exc:
                 sys.exit(str(exc))
             if not args.loadcell_no_cal:
-                raw_cal = load_calibration(args.force_port, path=args.loadcell_cal)
+                raw_cal = load_calibration(force_port, path=args.loadcell_cal)
             if raw_cal is not None:
                 print(
                     f"  Calibration: raw ADC, zero={raw_cal.zero_counts:.0f} "
@@ -406,7 +464,7 @@ def main():
             force_expected = True
             try:
                 force_ch = open_loadcell_channel(
-                    args.force_port,
+                    force_port,
                     range_kg=loadcell_range_kg,
                     baud=args.force_baud,
                     slave_id=args.loadcell_addr,
@@ -415,66 +473,44 @@ def main():
                     raw_cal=raw_cal,
                 )
                 print(
-                    f"  Force port: {args.force_port}  "
+                    f"  Force port: {force_port}  "
                     f"(RS485 load cell, {loadcell_range_kg:g} kg FS, addr {args.loadcell_addr})"
                 )
             except OSError as exc:
                 print(f"  Load cell not connected: {exc}", file=sys.stderr)
                 print(
-                    f"  Waiting for {args.force_port} — plug in the adapter anytime; "
+                    f"  Waiting for {force_port} — plug in the adapter anytime; "
                     "logging starts automatically."
                 )
         else:
-            force_port = args.force_port or auto_force_port()
-            if force_port:
-                try:
-                    force_ch = open_force_channel(force_port, baud=args.force_baud)
-                    print(f"  Force port: {force_port}")
-                except OSError as exc:
-                    print(f"  Warning: could not open Mark-10 on {force_port}: {exc}", file=sys.stderr)
-            elif args.force_port:
-                sys.exit(f"Could not open Mark-10 port {args.force_port!r}")
-            else:
-                print(
-                    "  No Mark-10 found (displacement only). "
-                    "Connect gauge USB or use --force-port / --force-type loadcell.",
-                    file=sys.stderr,
+            force_port = ports["force"] or auto_force_port()
+            if not force_port:
+                print(format_force_device_list(), file=sys.stderr)
+                sys.exit(
+                    "No Mark-10 found. Connect the gauge "
+                    "(or give --port force=PATH / --force-type loadcell)."
                 )
+            force_port = normalize_port(force_port)
+            try:
+                force_ch = open_force_channel(force_port, baud=args.force_baud)
+                print(f"  Force port: {force_port}")
+            except OSError as exc:
+                sys.exit(f"Could not open Mark-10 on {force_port!r}: {exc}")
 
-    if args.no_displacement and force_ch is None and not force_expected:
-        sys.exit(
-            "Force-only mode requires a force sensor.\n"
-            "Example:  spc-plot --no-displacement --force-type loadcell "
-            "--force-port /dev/ttyUSB0 --loadcell-range 100kg"
-        )
+    temp_ch: TemperatureChannel | None = None
+    if "temperature" in mode_names:
+        try:
+            temp_ch = open_temperature_channel(
+                ports["temperature"] or "usb", serial=args.temp_serial
+            )
+        except OSError as exc:
+            print(format_temperature_device_list(), file=sys.stderr)
+            sys.exit(str(exc))
+        print(f"  Temperature: Yocto-Thermocouple {temp_ch.serial} via {temp_ch.port}")
 
-    has_disp = ch is not None
     # In load cell mode the force channel counts as present even while the
     # adapter is unplugged — datasets/axes are created up front and samples
     # start flowing the moment the device (re)appears.
-    has_force = force_ch is not None or force_expected
-
-    data_file = resolve_data_path(args.data_file)
-    logger = DataLogger(
-        data_file,
-        args.device_id,
-        args.hz,
-        args.tag,
-        args.ch_name,
-        log_displacement=has_disp,
-        log_force=has_force,
-        force_device_id=args.force_id,
-        force_ch_name=args.force_ch_name,
-        force_capacity_n=capacity_n(loadcell_range_kg) if loadcell_range_kg else None,
-        log_counts=loadcell_range_kg is not None,
-        force_cal=raw_cal,
-    )
-
-    max_points = int(args.window * args.hz * 1.1)
-    times = collections.deque(maxlen=max_points)
-    mm_vals = collections.deque(maxlen=max_points)
-    n_vals = collections.deque(maxlen=max_points)
-
     is_loadcell = loadcell_range_kg is not None
     fmax = args.fmax
     if fmax is None:
@@ -485,13 +521,72 @@ def main():
         # Load cell reads positive-only; Mark-10 is bipolar (tension/compression).
         fmin = 0.0 if is_loadcell else -fmax
 
-    if has_disp and has_force:
-        title = "SPC displacement"
-        title += " + load cell force" if args.force_type == "loadcell" else " + Mark-10 force"
-    elif has_disp:
-        title = "SPC displacement"
-    else:
-        title = "Load cell force" if args.force_type == "loadcell" else "Force"
+    max_points = int(args.window * args.hz * 1.1)
+    times = collections.deque(maxlen=max_points)
+
+    def make_series(key: str, label: str, color: str, decimals: int) -> Series:
+        return Series(key, label, color, decimals,
+                      vals=collections.deque(maxlen=max_points))
+
+    # One Mode per --mode entry, in the user's order: first mode owns the left
+    # y-axis, each further mode adds its own axis on the right.
+    modes: list[Mode] = []
+    log_columns: list[tuple[str, str]] = []
+    log_attrs: dict[str, object] = {}
+    title_parts: list[str] = []
+    for name in mode_names:
+        if name == "displacement":
+            modes.append(Mode(name, UNIT_MM, DISP_COLOR, (args.ymin, args.ymax), [
+                make_series(DISPLACEMENT_DATASET, args.ch_name, DISP_COLOR, 4),
+            ]))
+            log_columns.append((DISPLACEMENT_DATASET, "f4"))
+            log_attrs["serial"] = args.device_id
+            log_attrs["units"] = UNIT_MM
+            log_attrs["channel_name"] = args.ch_name
+            title_parts.append("SPC displacement")
+        elif name == "force":
+            modes.append(Mode(name, UNIT_N, FORCE_COLOR, (fmin, fmax), [
+                make_series(FORCE_DATASET, args.force_ch_name, FORCE_COLOR, 4),
+            ]))
+            log_columns.append((FORCE_DATASET, "f4"))
+            log_attrs["force_serial"] = args.force_id
+            log_attrs["force_units"] = UNIT_N
+            log_attrs["force_channel_name"] = args.force_ch_name
+            if is_loadcell:
+                log_attrs["force_capacity_n"] = capacity_n(loadcell_range_kg)
+                # Raw counts are logged but not plotted (no Series).
+                log_columns.append((FORCE_COUNTS_DATASET, "f8"))
+                log_attrs["force_counts_source"] = "raw ADC (registers 40015/16)"
+                if raw_cal is not None:
+                    log_attrs["force_cal_source"] = "raw-adc"
+                    log_attrs["force_cal_zero_counts"] = raw_cal.zero_counts
+                    log_attrs["force_cal_counts_per_kg"] = raw_cal.counts_per_kg
+                else:
+                    log_attrs["force_cal_source"] = "scaled-register"
+            title_parts.append(
+                "load cell force" if is_loadcell else "Mark-10 force"
+            )
+        else:  # temperature
+            modes.append(Mode(name, UNIT_C, TEMP1_COLOR, (args.tmin, args.tmax), [
+                make_series(TEMP1_DATASET, args.temp_ch1_name, TEMP1_COLOR, 1),
+                make_series(TEMP2_DATASET, args.temp_ch2_name, TEMP2_COLOR, 1),
+            ]))
+            log_columns.append((TEMP1_DATASET, "f4"))
+            log_columns.append((TEMP2_DATASET, "f4"))
+            log_attrs["temp_serial"] = temp_ch.serial
+            log_attrs["temp_units"] = "C"
+            log_attrs["temp_ch1_name"] = args.temp_ch1_name
+            log_attrs["temp_ch2_name"] = args.temp_ch2_name
+            title_parts.append("thermocouple temperature")
+
+    all_series = [(m, s) for m in modes for s in m.series]
+
+    data_file = resolve_data_path(args.data_file)
+    logger = DataLogger(data_file, args.hz, args.tag,
+                        columns=log_columns, attrs=log_attrs)
+
+    title = " + ".join(title_parts)
+    title = title[0].upper() + title[1:]
 
     # "s" is our save-metadata key; drop it from matplotlib's save-figure
     # shortcut (ctrl+s still opens the save dialog). "q" is handled by our own
@@ -509,53 +604,35 @@ def main():
     fig.patch.set_facecolor(SURFACE)
     ax_main.set_facecolor(PANEL)
 
-    line_disp = None
-    line_force = None
-    ax_disp = ax_main if has_disp else None
-    ax_force = None
-    dual = has_disp and has_force
-
-    # In dual-channel mode each y-axis is tinted to its series so they can be
+    # With several modes each y-axis is tinted to its series so they can be
     # told apart; a lone axis wears plain text color.
-    if has_disp:
-        line_disp, = ax_main.plot([], [], color=DISP_COLOR, linewidth=2, label=args.ch_name)
-        ax_main.set_ylim(args.ymin, args.ymax)
-        disp_ink = DISP_COLOR if dual else INK
-        ax_main.set_ylabel(UNIT_MM, fontsize=15, color=disp_ink)
-        ax_main.tick_params(axis="y", labelcolor=disp_ink)
+    multi = len(modes) > 1
+    for i, mode in enumerate(modes):
+        mode.ax = ax_main if i == 0 else ax_main.twinx()
+        if i == 2:
+            # A third axis also sits on the right; push its spine outward so
+            # the two right-hand scales don't overprint.
+            mode.ax.spines["right"].set_position(("outward", 55))
+        for s in mode.series:
+            s.line, = mode.ax.plot([], [], color=s.color, linewidth=2,
+                                   label=s.label)
+        mode.ax.set_ylim(*mode.ylim)
+        ink = mode.axis_color if multi else INK
+        mode.ax.set_ylabel(mode.unit, fontsize=15, color=ink)
+        mode.ax.tick_params(axis="y", labelcolor=ink)
 
-    if has_force:
-        if has_disp:
-            ax_force = ax_main.twinx()
-        else:
-            ax_force = ax_main
-        line_force, = ax_force.plot(
-            [], [], color=FORCE_COLOR, linewidth=2, label=args.force_ch_name,
-        )
-        ax_force.set_ylim(fmin, fmax)
-        force_ink = FORCE_COLOR if dual else INK
-        ax_force.set_ylabel(UNIT_N, fontsize=15, color=force_ink)
-        ax_force.tick_params(axis="y", labelcolor=force_ink)
-
-    for ax in {ax_main, ax_force} - {None}:
+    for ax in {mode.ax for mode in modes}:
         ax.spines["top"].set_visible(False)
         for spine in ax.spines.values():
             spine.set_color(BORDER)
         ax.tick_params(color=BORDER, labelsize=13)
     ax_main.tick_params(axis="x", labelcolor=INK_MUTED)
-    if not dual:
+    if not multi:
         ax_main.spines["right"].set_visible(False)
 
-    legend_ax = ax_main
-    legend_lines = [ln for ln in (line_disp, line_force) if ln is not None]
-    legend_labels = []
-    if line_disp is not None:
-        legend_labels.append(args.ch_name)
-    if line_force is not None:
-        legend_labels.append(args.force_ch_name)
-    if legend_lines:
-        legend_ax.legend(legend_lines, legend_labels, loc="upper right",
-                         fontsize=13, frameon=False, labelcolor=INK)
+    ax_main.legend([s.line for _m, s in all_series],
+                   [s.label for _m, s in all_series],
+                   loc="upper right", fontsize=13, frameon=False, labelcolor=INK)
 
     ax_main.set_xlabel(f"Time before now  ({int(args.window)} s window)",
                        fontsize=13, color=INK_MUTED)
@@ -603,11 +680,11 @@ def main():
     )
     if force_expected:
         wait_text.set_text(
-            f"Load cell not connected — waiting for {args.force_port}"
+            f"Load cell not connected — waiting for {force_port}"
         )
         wait_text.set_visible(force_ch is None)
 
-    hover_color = DISP_COLOR if has_disp else FORCE_COLOR
+    hover_color = modes[0].series[0].color
     hover_dot, = ax_main.plot([], [], "o", color=hover_color, markersize=8, zorder=5,
                               markeredgecolor="white", markeredgewidth=1.5)
     hover_ann = ax_main.annotate(
@@ -621,10 +698,8 @@ def main():
     # --- Blitting: only the line/readout/hover artists are redrawn each frame,
     # over a cached static background. Mark them "animated" so full draws skip
     # them (keeping the cached background free of stale line data).
-    dyn_artists = tuple(
-        a for a in (line_disp, line_force, readout, status_text, wait_text,
-                    hover_dot, hover_ann)
-        if a is not None
+    dyn_artists = tuple(s.line for _m, s in all_series) + (
+        readout, status_text, wait_text, hover_dot, hover_ann,
     )
     for _a in dyn_artists:
         _a.set_animated(True)
@@ -658,11 +733,13 @@ def main():
         fig.canvas.draw()
 
     # live["x"] = relative seconds (plot coords), live["t_unix"] = absolute time
-    # for tooltips. Use len(), never truthiness.
-    live = {"x": np.empty(0), "t_unix": np.empty(0), "mm": np.empty(0), "n": np.empty(0)}
+    # for tooltips, plus one array per series key. Use len(), never truthiness.
+    live = {"x": np.empty(0), "t_unix": np.empty(0)}
+    for _m, s in all_series:
+        live[s.key] = np.empty(0)
 
     def on_hover(event):
-        hover_axes = tuple(a for a in (ax_disp, ax_force) if a is not None)
+        hover_axes = tuple(m.ax for m in modes)
         if event.inaxes not in hover_axes or len(live["x"]) == 0:
             hover_dot.set_data([], [])
             hover_ann.set_visible(False)
@@ -670,17 +747,15 @@ def main():
             return
 
         x_arr = live["x"]
-        if has_disp and len(live["mm"]):
-            y_arr = live["mm"]
-            hover_ax = ax_disp
-        elif has_force and len(live["n"]):
-            y_arr = live["n"]
-            hover_ax = ax_force
-        else:
+        # The dot/annotation anchor to the first series (in mode order) with data.
+        anchor = next(((m, s) for m, s in all_series if len(live[s.key])), None)
+        if anchor is None:
             hover_dot.set_data([], [])
             hover_ann.set_visible(False)
             blit_frame()
             return
+        hover_ax = anchor[0].ax
+        y_arr = live[anchor[1].key]
 
         x_display = hover_ax.transData.transform(np.column_stack([x_arr, y_arr]))[:, 0]
         idx = int(np.argmin(np.abs(x_display - event.x)))
@@ -690,14 +765,13 @@ def main():
             live["t_unix"][idx]
         ).strftime("%H:%M:%S.%f")[:-3]
         lines_txt = [ts]
-        if has_disp and len(live["mm"]):
-            vy_mm = live["mm"][idx]
-            mm_str = f"{vy_mm:.4f} {UNIT_MM}" if not np.isnan(vy_mm) else "No data"
-            lines_txt.append(f"{args.ch_name}: {mm_str}")
-        if has_force and len(live["n"]):
-            vy_f = live["n"][idx] if idx < len(live["n"]) else float("nan")
-            f_str = f"{vy_f:.4f} {UNIT_N}" if not np.isnan(vy_f) else "No data"
-            lines_txt.append(f"{args.force_ch_name}: {f_str}")
+        for m, s in all_series:
+            arr = live[s.key]
+            if not len(arr):
+                continue
+            vy_s = arr[idx] if idx < len(arr) else float("nan")
+            v_str = f"{vy_s:.{s.decimals}f} {m.unit}" if not np.isnan(vy_s) else "No data"
+            lines_txt.append(f"{s.label}: {v_str}")
 
         vy = y_arr[idx]
         if not np.isnan(vy):
@@ -719,16 +793,12 @@ def main():
 
     def reset_display() -> None:
         times.clear()
-        mm_vals.clear()
-        n_vals.clear()
         live["x"] = np.empty(0)
         live["t_unix"] = np.empty(0)
-        live["mm"] = np.empty(0)
-        live["n"] = np.empty(0)
-        if line_disp is not None:
-            line_disp.set_data([], [])
-        if line_force is not None:
-            line_force.set_data([], [])
+        for _m, s in all_series:
+            s.vals.clear()
+            s.line.set_data([], [])
+            live[s.key] = np.empty(0)
         hover_dot.set_data([], [])
         hover_ann.set_visible(False)
         readout.set_text("")
@@ -742,10 +812,10 @@ def main():
     fig._spc_force = force            # exposed for tests
     fig._spc_wait_text = wait_text    # exposed for tests
 
-    # Serial acquisition runs on a background thread and hands samples
-    # (t, mm, force_n, force_counts) to the GUI via this queue, so blocking
-    # reads never freeze inputs/redraws.
-    sample_q: "queue.Queue[tuple[float, float | None, float | None, float | None]]" = queue.Queue()
+    # Acquisition runs on a background thread and hands samples to the GUI via
+    # this queue as (t, {dataset_key: value}) so blocking reads never freeze
+    # inputs/redraws.
+    sample_q: "queue.Queue[tuple[float, dict[str, float | None]]]" = queue.Queue()
     stop_evt = threading.Event()
 
     def drain_queue() -> None:
@@ -820,11 +890,11 @@ def main():
 
     def connect_force() -> ForceChannel | None:
         """Try to (re)open the load cell; None while it is absent/unresponsive."""
-        if not port_present(args.force_port):
+        if not port_present(force_port):
             return None
         try:
             fch = open_loadcell_channel(
-                args.force_port,
+                force_port,
                 range_kg=loadcell_range_kg,
                 baud=args.force_baud,
                 slave_id=args.loadcell_addr,
@@ -848,8 +918,13 @@ def main():
             return None
         return fch
 
+    # Whether any channel besides the hot-pluggable load cell produces samples;
+    # with none, the sampler idles instead of logging all-NaN rows while the
+    # adapter is absent.
+    other_readers = ch is not None or temp_ch is not None
+
     def sampler_loop() -> None:
-        """Read the (slow, blocking) serial channels off the GUI thread."""
+        """Read the (slow, blocking) channels off the GUI thread."""
         next_t = time.monotonic()
         last_probe = -FORCE_RECONNECT_POLL_S
         while not stop_evt.is_set():
@@ -866,17 +941,19 @@ def main():
                     fch = connect_force()
                     if fch is not None:
                         force["ch"] = fch
-                        print(f"  Load cell connected on {args.force_port}")
-                if fch is None and ch is None:
-                    # Force-only mode with no device: idle (no NaN rows in the
-                    # log) until the adapter shows up.
+                        print(f"  Load cell connected on {force_port}")
+                if fch is None and not other_readers:
                     stop_evt.wait(0.1)
                     next_t = time.monotonic()
                     continue
 
-            mm = poll_channel(ch) if ch else None
-            force_n = None
-            counts = None
+            values: dict[str, float | None] = {}
+            if ch is not None:
+                values[DISPLACEMENT_DATASET] = poll_channel(ch)
+            if temp_ch is not None:
+                t1, t2 = poll_temperature(temp_ch)
+                values[TEMP1_DATASET] = t1
+                values[TEMP2_DATASET] = t2
             if fch is not None:
                 reading = None
                 read_exc: OSError | None = None
@@ -895,20 +972,20 @@ def main():
                     force["ch"] = None
                     last_probe = time.monotonic()
                     print(
-                        f"  Load cell unplugged — waiting for {args.force_port} "
+                        f"  Load cell unplugged — waiting for {force_port} "
                         "to reappear",
                         file=sys.stderr,
                     )
-                    if ch is None:
+                    if not other_readers:
                         next_t = time.monotonic()
-                        continue  # force-only: nothing to record this tick
+                        continue  # nothing else to record this tick
                 else:
                     if read_exc is not None:
                         print(f"  Force read error on {fch.port}: {read_exc}",
                               file=sys.stderr)
-                    force_n = to_n(reading)
-                    counts = getattr(fch, "last_counts", None)
-            sample_q.put((time.time(), mm, force_n, counts))
+                    values[FORCE_DATASET] = to_n(reading)
+                    values[FORCE_COUNTS_DATASET] = getattr(fch, "last_counts", None)
+            sample_q.put((time.time(), values))
             next_t += period
             delay = next_t - time.monotonic()
             if delay > 0:
@@ -918,15 +995,10 @@ def main():
 
     sampler = threading.Thread(target=sampler_loop, name="spc-sampler", daemon=True)
 
-    def fmt_mm(v: float) -> str:
+    def fmt(v: float, decimals: int, unit: str) -> str:
         if np.isnan(v):
             return "No data"
-        return f"{v:.4f} {UNIT_MM}"
-
-    def fmt_n(v: float) -> str:
-        if np.isnan(v):
-            return "No data"
-        return f"{v:.4f} {UNIT_N}"
+        return f"{v:.{decimals}f} {unit}"
 
     def on_timer() -> None:
         # Keep the "waiting for load cell" banner in sync with the sampler
@@ -945,16 +1017,15 @@ def main():
         last_t_unix = None
         while True:
             try:
-                t_unix, mm, force_n, counts = sample_q.get_nowait()
+                t_unix, values = sample_q.get_nowait()
             except queue.Empty:
                 break
             last_t_unix = t_unix
             times.append(t_unix)   # store absolute unix seconds
-            if has_disp:
-                mm_vals.append(mm if mm is not None else float("nan"))
-            if has_force:
-                n_vals.append(force_n if force_n is not None else float("nan"))
-            logger.append(t_unix, mm, force_n, counts)
+            for _m, s in all_series:
+                v = values.get(s.key)
+                s.vals.append(v if v is not None else float("nan"))
+            logger.append(t_unix, values)
 
         if last_t_unix is None or len(times) < 2:
             return
@@ -980,21 +1051,18 @@ def main():
         x_rel = t_unix_arr - time.time()
         live["x"] = x_rel
         live["t_unix"] = t_unix_arr
-        if line_disp is not None:
-            mm_arr = thin(mm_vals)
-            line_disp.set_data(x_rel, mm_arr)
-            live["mm"] = mm_arr
-        if line_force is not None:
-            n_arr = thin(n_vals)
-            line_force.set_data(x_rel, n_arr)
-            live["n"] = n_arr
+        for _m, s in all_series:
+            arr = thin(s.vals)
+            s.line.set_data(x_rel, arr)
+            live[s.key] = arr
 
         t_last = datetime.datetime.fromtimestamp(last_t_unix)
         readout_lines = []
-        if has_disp and mm_vals:
-            readout_lines.append(f"{args.ch_name}: {fmt_mm(mm_vals[-1])}")
-        if has_force and n_vals:
-            readout_lines.append(f"{args.force_ch_name}: {fmt_n(n_vals[-1])}")
+        for m, s in all_series:
+            if s.vals:
+                readout_lines.append(
+                    f"{s.label}: {fmt(s.vals[-1], s.decimals, m.unit)}"
+                )
         readout_lines.append(t_last.strftime("%H:%M:%S.%f")[:-3])
         readout.set_text("\n".join(readout_lines))
         blit_frame()
@@ -1004,6 +1072,10 @@ def main():
     fig._spc_timer = timer  # keep a reference so the timer stays alive
 
     fig.tight_layout(rect=(0, 0, 1, 0.862))
+    if len(modes) > 2:
+        # Leave room for the third axis's outward-offset spine; must happen
+        # before main_pos is read so the info bar spans the adjusted width.
+        fig.subplots_adjust(right=0.90)
 
     # Top info bar: one panel spanning the plot width, split into cells —
     # Cycle | Label (text entry) | Shortcuts | Status. Fieldset style: each
@@ -1209,7 +1281,7 @@ def main():
         if sampler.is_alive():
             print("  Warning: sampler thread still busy at exit.", file=sys.stderr)
         logger.close()
-        for c in (ch, force["ch"]):
+        for c in (ch, force["ch"], temp_ch):
             if c is not None:
                 try:
                     c.close()

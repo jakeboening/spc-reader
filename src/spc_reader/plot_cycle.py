@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot a recorded displacement (and optional force) cycle from the HDF5 log.
+"""Plot a recorded cycle (displacement / force / temperature) from the HDF5 log.
 
 Usage
 -----
@@ -21,10 +21,63 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from .paths import default_log_path, resolve_data_path
-from .spc_io import LBF_TO_N, read_displacement_mm, read_force_n, try_read_displacement_mm
+from .spc_io import (
+    DISPLACEMENT_DATASET,
+    FORCE_DATASET,
+    LBF_TO_N,
+    TEMP1_DATASET,
+    TEMP2_DATASET,
+    read_force_n,
+    read_temperatures_c,
+    try_read_displacement_mm,
+)
 
 DISP_COLOR = "#eb6834"   # orange — displacement series (matches plot_live)
 FORCE_COLOR = "#2a78d6"  # blue — force series (matches plot_live)
+TEMP1_COLOR = "#9333ea"  # purple — thermocouple 1 (matches plot_live)
+TEMP2_COLOR = "#0d9488"  # teal — thermocouple 2 (matches plot_live)
+
+
+def load_channels(grp, meta: dict) -> list[dict]:
+    """Channels present in a cycle group, in display order (first owns the
+    left axis). Each: kind/unit/decimals/ylim (None = autoscale) and series
+    as (dataset_key, label, color, array) tuples."""
+    channels: list[dict] = []
+    mm = try_read_displacement_mm(grp)
+    if mm is not None and len(mm):
+        channels.append({
+            "kind": "displacement", "unit": "mm", "decimals": 2, "ylim": (0, 30),
+            "series": [(
+                DISPLACEMENT_DATASET,
+                meta.get("channel_name", meta.get("ch1_name", "SPC")),
+                DISP_COLOR, mm,
+            )],
+        })
+    force_n = read_force_n(grp)
+    if force_n is not None and len(force_n):
+        cap = float(meta.get("force_capacity_n", 10 * LBF_TO_N))
+        channels.append({
+            "kind": "force", "unit": "N", "decimals": 3, "ylim": (-cap, cap),
+            "series": [(
+                FORCE_DATASET, meta.get("force_channel_name", "Force"),
+                FORCE_COLOR, force_n,
+            )],
+        })
+    t1, t2 = read_temperatures_c(grp)
+    temp_series = []
+    if t1 is not None and len(t1):
+        temp_series.append((TEMP1_DATASET, meta.get("temp_ch1_name", "TC1"),
+                            TEMP1_COLOR, t1))
+    if t2 is not None and len(t2):
+        temp_series.append((TEMP2_DATASET, meta.get("temp_ch2_name", "TC2"),
+                            TEMP2_COLOR, t2))
+    if temp_series:
+        channels.append({
+            # Autoscale on read-back — exploration beats fixed limits here.
+            "kind": "temperature", "unit": "°C", "decimals": 1, "ylim": None,
+            "series": temp_series,
+        })
+    return channels
 
 
 def load_cycles(path: str) -> list[dict]:
@@ -38,9 +91,8 @@ def load_cycles(path: str) -> list[dict]:
         for name in sorted(grp.keys()):
             g = grp[name]
             t = g["time"][:]
-            mm = try_read_displacement_mm(g)
-            force_n = read_force_n(g)
-            has_disp = mm is not None and len(mm) > 0
+            meta = {k: g.attrs[k] for k in g.attrs}
+            channels = load_channels(g, meta)
             duration = t[-1] - t[0] if len(t) > 1 else 0
             entry = {
                 "name":      name,
@@ -50,92 +102,61 @@ def load_cycles(path: str) -> list[dict]:
                 "start_iso": g.attrs.get("start_iso", ""),
                 "n":         len(t),
                 "duration":  duration,
-                "has_disp":  has_disp,
-                "has_force": force_n is not None and len(force_n) > 0,
+                "kinds":     {c["kind"] for c in channels},
             }
-            if has_disp:
-                entry["mm_min"] = float(mm.min())
-                entry["mm_max"] = float(mm.max())
-                entry["mm_mean"] = float(mm.mean())
-            if entry["has_force"]:
-                entry["n_min"] = float(force_n.min())
-                entry["n_max"] = float(force_n.max())
-                entry["n_mean"] = float(force_n.mean())
+            for c in channels:
+                allv = np.concatenate([arr for _k, _l, _c, arr in c["series"]])
+                valid = allv[~np.isnan(allv.astype(float))]
+                if len(valid):
+                    entry[f"{c['kind']}_min"] = float(valid.min())
+                    entry[f"{c['kind']}_max"] = float(valid.max())
             cycles.append(entry)
     return cycles
 
 
+# Per-kind list column layout: (kind, unit, width, decimals).
+_LIST_COLUMNS = (
+    ("displacement", "mm", 7, 2),
+    ("force", "N", 8, 3),
+    ("temperature", "°C", 7, 1),
+)
+
+
 def list_cycles(cycles: list[dict]) -> None:
-    has_force = any(c["has_force"] for c in cycles)
-    has_disp = any(c.get("has_disp", True) for c in cycles)
-    if has_disp and has_force:
-        header = (
-            f"{'#':>6}  {'Start':>19}  {'Dur (s)':>8}  "
-            f"{'Min mm':>7}  {'Max mm':>7}  {'Min N':>8}  {'Max N':>8}  "
-            f"{'n':>6}  Tag"
-        )
-    elif has_force:
-        header = (
-            f"{'#':>6}  {'Start':>19}  {'Dur (s)':>8}  "
-            f"{'Min N':>8}  {'Max N':>8}  {'Mean N':>8}  {'n':>6}  Tag"
-        )
-    else:
-        header = (
-            f"{'#':>6}  {'Start':>19}  {'Dur (s)':>8}  "
-            f"{'Min mm':>7}  {'Max mm':>7}  {'Mean mm':>8}  {'n':>6}  Tag"
-        )
+    cols = [c for c in _LIST_COLUMNS
+            if any(c[0] in cyc["kinds"] for cyc in cycles)]
+    header = f"{'#':>6}  {'Start':>19}  {'Dur (s)':>8}"
+    for kind, unit, w, _d in cols:
+        header += f"  {'Min ' + unit:>{w}}  {'Max ' + unit:>{w}}"
+    header += f"  {'n':>6}  Tag"
     print(header)
     print("-" * len(header))
     for c in cycles:
         idx = int(c["name"])
         start = c["start_iso"][:19].replace("T", " ") if c["start_iso"] else "?"
         tag = c["tag"] or "—"
-        if has_disp and has_force and c.get("has_disp") and c["has_force"]:
-            print(
-                f"{idx:>6}  {start:>19}  {c['duration']:>8.1f}"
-                f"  {c['mm_min']:>7.2f}  {c['mm_max']:>7.2f}"
-                f"  {c['n_min']:>8.3f}  {c['n_max']:>8.3f}"
-                f"  {c['n']:>6}  {tag}"
-            )
-        elif has_disp and has_force:
-            mm_min = c.get("mm_min", float("nan"))
-            mm_max = c.get("mm_max", float("nan"))
-            n_min = c.get("n_min", float("nan"))
-            n_max = c.get("n_max", float("nan"))
-            print(
-                f"{idx:>6}  {start:>19}  {c['duration']:>8.1f}"
-                f"  {mm_min:>7.2f}  {mm_max:>7.2f}"
-                f"  {n_min:>8.3f}  {n_max:>8.3f}"
-                f"  {c['n']:>6}  {tag}"
-            )
-        elif has_force and c["has_force"]:
-            print(
-                f"{idx:>6}  {start:>19}  {c['duration']:>8.1f}"
-                f"  {c['n_min']:>8.3f}  {c['n_max']:>8.3f}  {c['n_mean']:>8.3f}"
-                f"  {c['n']:>6}  {tag}"
-            )
-        elif c.get("has_disp"):
-            print(
-                f"{idx:>6}  {start:>19}  {c['duration']:>8.1f}"
-                f"  {c['mm_min']:>7.2f}  {c['mm_max']:>7.2f}  {c['mm_mean']:>8.2f}"
-                f"  {c['n']:>6}  {tag}"
-            )
+        row = f"{idx:>6}  {start:>19}  {c['duration']:>8.1f}"
+        for kind, _unit, w, d in cols:
+            vmin = c.get(f"{kind}_min")
+            vmax = c.get(f"{kind}_max")
+            row += (f"  {vmin:>{w}.{d}f}  {vmax:>{w}.{d}f}"
+                    if vmin is not None else f"  {'—':>{w}}  {'—':>{w}}")
+        row += f"  {c['n']:>6}  {tag}"
+        print(row)
 
 
 def load_data(path: str, name: str):
     with h5py.File(path, "r") as f:
         grp = f[f"cycles/{name}"]
         t = grp["time"][:]
-        mm = try_read_displacement_mm(grp)
-        force_n = read_force_n(grp)
         meta = {k: grp.attrs[k] for k in grp.attrs}
-    return t, mm, force_n, meta
+        channels = load_channels(grp, meta)
+    return t, channels, meta
 
 
 def export_cycle_csv(
     t: np.ndarray,
-    mm: np.ndarray | None,
-    force_n: np.ndarray | None,
+    channels: list[dict],
     meta: dict,
     name: str,
     out: str | None = None,
@@ -144,12 +165,11 @@ def export_cycle_csv(
 
     Parameters
     ----------
-    t:       Unix epoch timestamps (float64).
-    mm:      Displacement values in mm.
-    force_n: Force values in N, or None if not recorded.
-    meta:    HDF5 group attributes dict.
-    name:    Zero-padded HDF5 group name, e.g. ``"000003"``.
-    out:     Output path.  Defaults to ``cycle_<N>.csv`` in the current directory.
+    t:        Unix epoch timestamps (float64).
+    channels: Channel dicts from ``load_channels``.
+    meta:     HDF5 group attributes dict.
+    name:     Zero-padded HDF5 group name, e.g. ``"000003"``.
+    out:      Output path.  Defaults to ``cycle_<N>.csv`` in the current directory.
 
     Returns
     -------
@@ -161,29 +181,28 @@ def export_cycle_csv(
         out = f"cycle_{cycle_num}.csv"
     out = os.path.abspath(out)
 
-    has_disp = mm is not None and len(mm) > 0
-    has_force = force_n is not None and len(force_n) > 0
+    kinds = {c["kind"] for c in channels}
 
     with open(out, "w", newline="") as fh:
         # Metadata comment header
         fh.write(f"# cycle: {cycle_num}\n")
         fh.write(f"# tag: {meta.get('tag', '')}\n")
         fh.write(f"# start: {meta.get('start_iso', '')}\n")
-        if has_disp:
+        if "displacement" in kinds:
             fh.write(f"# serial: {meta.get('serial', '')}\n")
             fh.write(f"# displacement_units: {meta.get('units', 'mm')}\n")
         fh.write(f"# hz: {meta.get('hz', '')}\n")
-        if has_force:
+        if "force" in kinds:
             fh.write(f"# force_serial: {meta.get('force_serial', '')}\n")
             fh.write(f"# force_units: {meta.get('force_units', 'N')}\n")
+        if "temperature" in kinds:
+            fh.write(f"# temp_serial: {meta.get('temp_serial', '')}\n")
+            fh.write(f"# temp_units: {meta.get('temp_units', 'C')}\n")
 
-        fieldnames = ["time_unix", "elapsed_s"]
-        if has_disp:
-            fieldnames.append("displacement_mm")
-        if has_force:
-            fieldnames.append("force_n")
-
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        columns = [(key, arr) for c in channels
+                   for key, _label, _color, arr in c["series"]]
+        writer = csv.DictWriter(fh, fieldnames=["time_unix", "elapsed_s",
+                                                *(key for key, _a in columns)])
         writer.writeheader()
 
         t0 = float(t[0]) if len(t) else 0.0
@@ -192,10 +211,8 @@ def export_cycle_csv(
                 "time_unix": f"{t[i]:.6f}",
                 "elapsed_s": f"{t[i] - t0:.6f}",
             }
-            if has_disp:
-                row["displacement_mm"] = f"{mm[i]:.6f}"
-            if has_force:
-                row["force_n"] = f"{force_n[i]:.6f}"
+            for key, arr in columns:
+                row[key] = f"{arr[i]:.6f}"
             writer.writerow(row)
 
     return out
@@ -213,8 +230,7 @@ def fmt_elapsed(seconds: float) -> str:
 
 def plot_cycle(
     t_unix: np.ndarray,
-    mm: np.ndarray | None,
-    force_n: np.ndarray | None,
+    channels: list[dict],
     meta: dict,
     name: str,
 ) -> None:
@@ -223,49 +239,31 @@ def plot_cycle(
 
     tag = meta.get("tag", "")
     start = meta.get("start_iso", "")[:19].replace("T", " ")
-    disp_label = meta.get("channel_name", meta.get("ch1_name", "SPC"))
-    force_label = meta.get("force_channel_name", "Force")
-    has_disp = mm is not None and len(mm) > 0
-    has_force = force_n is not None and len(force_n) > 0
 
-    if has_disp and has_force:
-        title = "Displacement + force cycle"
-    elif has_force:
-        title = "Force cycle"
-    else:
-        title = "SPC displacement cycle"
+    title = " + ".join(c["kind"] for c in channels).capitalize() + " cycle"
     fig, ax_main = plt.subplots(num=title, figsize=(13, 6))
     fig.patch.set_facecolor("#F0F0F0")
     ax_main.set_facecolor("#F0F0F0")
 
-    ax_force = None
-    if has_disp:
-        ax_main.plot(t_rel, mm, color=DISP_COLOR, linewidth=1.5, label=disp_label)
-        ax_main.set_ylim(0, 30)
-        ax_main.set_ylabel("mm", fontsize=17, fontweight="bold", color=DISP_COLOR)
-        ax_main.tick_params(axis="y", labelcolor=DISP_COLOR)
-
-    if has_force:
-        if has_disp:
-            ax_force = ax_main.twinx()
-        else:
-            ax_force = ax_main
-        ax_force.plot(t_rel, force_n, color=FORCE_COLOR, linewidth=1.5, label=force_label)
-        cap = float(meta.get("force_capacity_n", 10 * LBF_TO_N))
-        ax_force.set_ylim(-cap, cap)
-        ax_force.set_ylabel("N", fontsize=17, fontweight="bold", color=FORCE_COLOR)
-        ax_force.tick_params(axis="y", labelcolor=FORCE_COLOR)
-
-    legend_lines = list(ax_main.lines)
-    if ax_force is not None and ax_force is not ax_main:
-        legend_lines.extend(ax_force.lines)
+    legend_lines = []
     legend_labels = []
-    if has_disp:
-        legend_labels.append(disp_label)
-    if has_force:
-        legend_labels.append(force_label)
-    if legend_lines:
-        ax_main.legend(legend_lines, legend_labels, loc="upper right", fontsize=14)
+    for i, chn in enumerate(channels):
+        ax = ax_main if i == 0 else ax_main.twinx()
+        if i == 2:
+            # Third axis also sits on the right; offset its spine outward.
+            ax.spines["right"].set_position(("outward", 55))
+        chn["ax"] = ax
+        for _key, label, color, arr in chn["series"]:
+            ln, = ax.plot(t_rel, arr, color=color, linewidth=1.5, label=label)
+            legend_lines.append(ln)
+            legend_labels.append(label)
+        if chn["ylim"] is not None:
+            ax.set_ylim(*chn["ylim"])
+        axis_color = chn["series"][0][2]
+        ax.set_ylabel(chn["unit"], fontsize=17, fontweight="bold", color=axis_color)
+        ax.tick_params(axis="y", labelcolor=axis_color)
+
+    ax_main.legend(legend_lines, legend_labels, loc="upper right", fontsize=14)
 
     nice = [1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 300, 600, 900, 1800, 3600]
     tick_interval = min(nice, key=lambda x: abs(x - max(duration_s, 1) / 8))
@@ -287,31 +285,24 @@ def plot_cycle(
     ax_main.set_title("\n".join(title_lines), fontsize=16)
 
     stats_lines = []
-    if has_disp:
-        valid_mm = mm[~np.isnan(mm.astype(float))]
-        if len(valid_mm):
-            stats_lines.append(
-                f"{disp_label}:  min {valid_mm.min():.2f}  max {valid_mm.max():.2f}"
-                f"  mean {valid_mm.mean():.2f} mm  n={len(valid_mm):,}"
-            )
-        else:
-            stats_lines.append(f"{disp_label}: no data")
-    if has_force:
-        valid_f = force_n[~np.isnan(force_n.astype(float))]
-        if len(valid_f):
-            stats_lines.append(
-                f"{force_label}:  min {valid_f.min():.3f}  max {valid_f.max():.3f}"
-                f"  mean {valid_f.mean():.3f} N  n={len(valid_f):,}"
-            )
-        else:
-            stats_lines.append(f"{force_label}: no data")
+    for chn in channels:
+        d = chn["decimals"]
+        for _key, label, _color, arr in chn["series"]:
+            valid = arr[~np.isnan(arr.astype(float))]
+            if len(valid):
+                stats_lines.append(
+                    f"{label}:  min {valid.min():.{d}f}  max {valid.max():.{d}f}"
+                    f"  mean {valid.mean():.{d}f} {chn['unit']}  n={len(valid):,}"
+                )
+            else:
+                stats_lines.append(f"{label}: no data")
     ax_main.text(
         0.01, 0.97, "\n".join(stats_lines), transform=ax_main.transAxes,
         fontsize=13, verticalalignment="top", family="monospace",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.82, edgecolor="black"),
     )
 
-    hover_color = DISP_COLOR if has_disp else FORCE_COLOR
+    hover_color = channels[0]["series"][0][2]
     hover_dot, = ax_main.plot([], [], "o", color=hover_color, markersize=7, zorder=5)
     hover_ann = ax_main.annotate(
         "", xy=(0, 0), xytext=(8, 8), textcoords="offset points",
@@ -321,33 +312,27 @@ def plot_cycle(
     )
 
     def on_hover(event):
-        hover_axes = tuple(a for a in (ax_main if has_disp else None, ax_force) if a is not None)
+        hover_axes = tuple(c["ax"] for c in channels)
         if event.inaxes not in hover_axes:
             hover_dot.set_data([], [])
             hover_ann.set_visible(False)
             fig.canvas.draw_idle()
             return
 
-        if has_disp:
-            hover_ax = ax_main
-            y_arr = mm
-        else:
-            hover_ax = ax_force
-            y_arr = force_n
+        # Dot/annotation anchor to the first channel's first series.
+        hover_ax = channels[0]["ax"]
+        y_arr = channels[0]["series"][0][3]
 
         x_display = hover_ax.transData.transform(np.column_stack([t_rel, y_arr]))[:, 0]
         idx = int(np.argmin(np.abs(x_display - event.x)))
         tx = t_rel[idx]
+        vy = float(y_arr[idx])
         lines_txt = [f"t = {fmt_elapsed(tx)}"]
-        if has_disp:
-            vy_mm = float(mm[idx])
-            lines_txt.append(f"{disp_label}: {vy_mm:.2f} mm")
-            vy = vy_mm
-        if has_force:
-            vy_f = float(force_n[idx])
-            lines_txt.append(f"{force_label}: {vy_f:.3f} N")
-            if not has_disp:
-                vy = vy_f
+        for chn in channels:
+            for _key, label, _color, arr in chn["series"]:
+                lines_txt.append(
+                    f"{label}: {float(arr[idx]):.{chn['decimals']}f} {chn['unit']}"
+                )
         hover_dot.set_data([tx], [vy])
         hover_ann.xy = (tx, vy)
         hover_ann.set_text("\n".join(lines_txt))
@@ -362,6 +347,9 @@ def plot_cycle(
 
     fig.canvas.mpl_connect("motion_notify_event", on_hover)
     plt.tight_layout()
+    if len(channels) > 2:
+        # Room for the third axis's outward-offset spine.
+        fig.subplots_adjust(right=0.88)
     plt.show()
 
 
@@ -410,14 +398,16 @@ def main():
         chosen = matches[0]
 
     data_file = resolve_data_path(args.data_file)
-    t, mm, force_n, meta = load_data(data_file, chosen["name"])
+    t, channels, meta = load_data(data_file, chosen["name"])
+    if not channels:
+        sys.exit(f"Cycle {int(chosen['name'])} contains no known data channels.")
 
     if args.csv is not None:
         out_path = args.csv if args.csv else None
-        written = export_cycle_csv(t, mm, force_n, meta, chosen["name"], out=out_path)
+        written = export_cycle_csv(t, channels, meta, chosen["name"], out=out_path)
         print(f"Exported cycle {int(chosen['name'])} → {written}")
     else:
-        plot_cycle(t, mm, force_n, meta, chosen["name"])
+        plot_cycle(t, channels, meta, chosen["name"])
 
 
 if __name__ == "__main__":
