@@ -1187,10 +1187,13 @@ def main():
 
     fig.canvas.mpl_connect("close_event", on_close)
 
-    # If the process dies by signal (closed terminal → SIGHUP, kill → SIGTERM),
-    # exit via SystemExit so the finally block below still closes the port.
-    for _sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(_sig, lambda *_a: sys.exit(1))
+    # If the process dies by signal (closed terminal → SIGHUP, kill → SIGTERM,
+    # Ctrl+Break on Windows → SIGBREAK), exit via SystemExit so the finally
+    # block below still closes the port. Not every signal exists per platform.
+    for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        _sig = getattr(signal, _name, None)
+        if _sig is not None:
+            signal.signal(_sig, lambda *_a: sys.exit(1))
 
     fig.canvas.draw()      # realize a renderer so the bar contents can be measured
     layout_bar()
