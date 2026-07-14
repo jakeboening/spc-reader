@@ -11,8 +11,10 @@ import datetime
 import os
 import queue
 import re
+import shutil
 import signal
 import sys
+import textwrap
 import threading
 import time
 from dataclasses import dataclass, field
@@ -180,9 +182,6 @@ class DataLogger:
             self._grp_path = f"cycles/{grp_name}"
             self._cycle_name = grp_name
             self._label = ""
-
-        tag_display = f"  tag={self._tag!r}" if self._tag else ""
-        print(f"Logging → {self._path}  [{self._grp_path}]{tag_display}")
 
     @property
     def cycle_name(self) -> str:
@@ -363,6 +362,53 @@ def parse_args():
     return args
 
 
+def _display_path(path: str) -> str:
+    """Shorten a path under $HOME to ~/... for display."""
+    home = os.path.expanduser("~")
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def format_startup_panel(rows: list[tuple[str, str]], footer: list[str],
+                         ascii_only: bool = False) -> str:
+    """Bordered two-section summary box printed once at startup.
+
+    Fits the terminal: long values wrap onto continuation lines aligned
+    under the value column.
+    """
+    tl, tr, bl, br, h, v, ml, mr = (
+        ("+", "+", "+", "+", "-", "|", "+", "+") if ascii_only
+        else ("╭", "╮", "╰", "╯", "─", "│", "├", "┤")
+    )
+    term_w = shutil.get_terminal_size((100, 24)).columns
+    max_content = max(40, min(96, term_w - 6))
+    label_w = max(len(label) for label, _ in rows)
+    body: list[str] = []
+    for label, value in rows:
+        parts = textwrap.wrap(value, max_content - label_w - 3) or [""]
+        body.append(f"{label:<{label_w}}   {parts[0]}")
+        body.extend(f"{'':<{label_w}}   {cont}" for cont in parts[1:])
+    wrapped_footer = [line for f in footer
+                      for line in (textwrap.wrap(f, max_content) or [""])]
+    footer = wrapped_footer
+    width = max(len(line) for line in body + footer)
+
+    def edge(left: str, right: str) -> str:
+        return left + h * (width + 4) + right
+
+    def line(s: str) -> str:
+        return f"{v}  {s:<{width}}  {v}"
+
+    return "\n".join([
+        edge(tl, tr),
+        *(line(b) for b in body),
+        edge(ml, mr),
+        *(line(f) for f in footer),
+        edge(bl, br),
+    ])
+
+
 def poll_channel(ch: SPCChannel) -> float:
     try:
         return to_mm(ch.read())
@@ -395,6 +441,8 @@ def main():
 
     mode_names: list[str] = args.mode
     ports: dict[str, str | None] = args.ports
+    # Startup summary rows, printed as one bordered panel once setup is done.
+    panel_rows: list[tuple[str, str]] = []
 
     if args.force_baud is None:
         args.force_baud = 9600 if args.force_type == "loadcell" else 115200
@@ -418,7 +466,7 @@ def main():
                 "  sudo spc-reader-install-udev\n"
                 "  sudo udevadm control --reload && sudo udevadm trigger"
             )
-        print(f"  Displacement port: {port}")
+        panel_rows.append(("Displacement", port))
 
     force_ch: ForceChannel | None = None
     loadcell_range_kg: float | None = None
@@ -451,19 +499,22 @@ def main():
             if not args.loadcell_no_cal:
                 raw_cal = load_calibration(force_port, path=args.loadcell_cal)
             if raw_cal is not None:
-                print(
-                    f"  Calibration: raw ADC, zero={raw_cal.zero_counts:.0f} "
-                    f"counts, {raw_cal.counts_per_kg:.1f} counts/kg"
-                )
+                panel_rows.append((
+                    "Calibration",
+                    f"raw ADC — zero {raw_cal.zero_counts:.0f} counts, "
+                    f"{raw_cal.counts_per_kg:.1f} counts/kg",
+                ))
             else:
-                print(
-                    "  Calibration: none — using transmitter's scaled register "
-                    "(may be whole-kg only). Run spc-loadcell-cal for resolution.",
-                    file=sys.stderr,
-                )
+                panel_rows.append((
+                    "Calibration",
+                    "none — transmitter's scaled register (whole-kg only); "
+                    "run spc-loadcell-cal",
+                ))
             if args.force_id == "M5":
                 args.force_id = "LC"
             force_expected = True
+            lc_desc = (f"RS485 load cell, {loadcell_range_kg:g} kg FS, "
+                       f"addr {args.loadcell_addr}")
             try:
                 force_ch = open_loadcell_channel(
                     force_port,
@@ -474,16 +525,13 @@ def main():
                     debug=args.loadcell_debug,
                     raw_cal=raw_cal,
                 )
-                print(
-                    f"  Force port: {force_port}  "
-                    f"(RS485 load cell, {loadcell_range_kg:g} kg FS, addr {args.loadcell_addr})"
-                )
+                panel_rows.append(("Force", f"{force_port}  ({lc_desc})"))
             except OSError as exc:
                 print(f"  Load cell not connected: {exc}", file=sys.stderr)
-                print(
-                    f"  Waiting for {force_port} — plug in the adapter anytime; "
-                    "logging starts automatically."
-                )
+                panel_rows.append((
+                    "Force",
+                    f"waiting for {force_port} — plug in anytime  ({lc_desc})",
+                ))
         else:
             force_port = ports["force"] or auto_force_port()
             if not force_port:
@@ -495,7 +543,7 @@ def main():
             force_port = normalize_port(force_port)
             try:
                 force_ch = open_force_channel(force_port, baud=args.force_baud)
-                print(f"  Force port: {force_port}")
+                panel_rows.append(("Force", f"{force_port}  (Mark-10)"))
             except OSError as exc:
                 sys.exit(f"Could not open Mark-10 on {force_port!r}: {exc}")
 
@@ -509,7 +557,9 @@ def main():
             print(format_temperature_device_list(), file=sys.stderr)
             sys.exit(str(exc))
         for tch in temp_chs:
-            print(f"  Temperature: Yocto-Thermocouple {tch.serial} via {tch.port}")
+            panel_rows.append(
+                ("Temperature", f"Yocto-Thermocouple {tch.serial}  ({tch.port})")
+            )
 
     # In load cell mode the force channel counts as present even while the
     # adapter is unplugged — datasets/axes are created up front and samples
@@ -597,6 +647,9 @@ def main():
     data_file = resolve_data_path(args.data_file)
     logger = DataLogger(data_file, args.hz, args.tag,
                         columns=log_columns, attrs=log_attrs)
+    panel_rows.append(("Log file", _display_path(data_file)))
+    panel_rows.append(("Cycle", logger.cycle_name
+                       + (f"   tag: {args.tag}" if args.tag else "")))
 
     title = " + ".join(title_parts)
     title = title[0].upper() + title[1:]
@@ -913,7 +966,15 @@ def main():
         full_refresh()
 
     fig.canvas.mpl_connect("key_press_event", on_key)
-    print("  Press t to stop/start a run; s to save the label; q to quit.")
+    panel_footer = [
+        "t  stop/start run      s  save label      q  quit",
+        "Type a run note in the Label box; press s to save it to the cycle",
+    ]
+    panel = format_startup_panel(panel_rows, panel_footer)
+    try:
+        print(f"\n{panel}\n")
+    except UnicodeEncodeError:  # redirected legacy-codepage console
+        print(f"\n{format_startup_panel(panel_rows, panel_footer, ascii_only=True)}\n")
 
     GUI_INTERVAL_MS = 25  # ~40 fps; blitting keeps each frame cheap
     period = 1.0 / args.hz
@@ -1281,7 +1342,6 @@ def main():
         update_dirty_indicator()
 
     textbox.on_text_change(on_label_change)
-    print("  Type a note in the 'Cycle label' field; press s to save it to the current run.")
 
     def on_close(_event) -> None:
         # Stop the timer and sampler the moment the window closes (q, cmd+w,
