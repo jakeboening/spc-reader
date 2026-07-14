@@ -23,6 +23,7 @@ spc-plot = "spc_reader.plot_live:main"
 spc-plot-cycle = "spc_reader.plot_cycle:main"
 spc-loadcell-probe = "spc_reader.loadcell_io:probe_main"
 spc-loadcell-cal = "spc_reader.loadcell_io:cal_main"
+spc-reader-install-udev = "spc_reader.install_udev:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

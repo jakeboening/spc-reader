@@ -13,7 +13,30 @@ Real-time multi-mode plot and HDF5 logger. Pick one or more modes with
 
 ---
 
-## macOS quick-start (load cell only)
+## Install (one line)
+
+**macOS / Linux** — in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jakeboening/spc-reader/main/install.sh | bash
+```
+
+**Windows** — in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/jakeboening/spc-reader/main/install.ps1 | iex
+```
+
+The installer needs Python 3.10+ on the machine (it tells you where to get it if missing), puts everything under `~/.spc-reader`, links the `spc-plot` commands onto your PATH, and is safe to re-run anytime to update. Then, in a **new** terminal:
+
+```bash
+spc-plot --list-ports
+spc-plot --mode temperature
+```
+
+---
+
+## macOS notes (developer install)
 
 No udev rules or `dialout` group needed — USB serial ports under `/dev/cu.*` are world-accessible. tkinter is optional: when it is missing (typical for Homebrew Python), the native `macosx` matplotlib backend is used automatically.
 
@@ -37,15 +60,11 @@ spc-loadcell-cal --port /dev/cu.usbserial-B0009XBW
 
 ---
 
-## Windows quick-start
+## Windows notes
 
-Install **Python 3.10+** from [python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*; tkinter is included, so the plot window works out of the box). Then in PowerShell:
+Install **Python 3.10+** from [python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*; tkinter is included, so the plot window works out of the box), then run the one-line installer above. Typical commands:
 
 ```powershell
-cd $HOME\src\spc-reader
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e .
 spc-plot --list-ports          # find the adapter, e.g. COM5
 spc-plot --mode force --force-type loadcell --port COM5 --loadcell-range 100kg
 spc-plot --mode force --port COM4          # Mark-10
