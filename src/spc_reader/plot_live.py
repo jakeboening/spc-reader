@@ -718,6 +718,15 @@ def main():
         _a.set_animated(True)
 
     render = {"bg": None}
+    # Set on close_event before teardown. Callbacks queued behind the close
+    # (timer ticks, motion events) must not touch the canvas: on Windows/Tk
+    # matplotlib swaps in a plain FigureCanvasBase during window destruction,
+    # which lacks the Agg blitting API (restore_region/copy_from_bbox), and
+    # drawing on the dead Tk widget raises.
+    closing = {"on": False}
+
+    def _can_draw() -> bool:
+        return not closing["on"] and hasattr(fig.canvas, "restore_region")
 
     def _draw_dynamic() -> None:
         for a in dyn_artists:
@@ -727,6 +736,8 @@ def main():
     def on_draw(_event=None) -> None:
         # After any full draw (startup, resize, expose, widget typing) re-cache the
         # background and immediately repaint the dynamic artists on top of it.
+        if not _can_draw():
+            return
         render["bg"] = fig.canvas.copy_from_bbox(fig.bbox)
         _draw_dynamic()
         fig.canvas.blit(fig.bbox)
@@ -734,6 +745,8 @@ def main():
     fig.canvas.mpl_connect("draw_event", on_draw)
 
     def blit_frame() -> None:
+        if not _can_draw():
+            return
         if render["bg"] is None:
             fig.canvas.draw()   # triggers on_draw, which caches bg and blits
             return
@@ -743,6 +756,8 @@ def main():
 
     def full_refresh() -> None:
         # Force a full redraw (picks up title/axis/widget changes), then blit.
+        if not _can_draw():
+            return
         fig.canvas.draw()
 
     # live["x"] = relative seconds (plot coords), live["t_unix"] = absolute time
@@ -752,6 +767,8 @@ def main():
         live[s.key] = np.empty(0)
 
     def on_hover(event):
+        if closing["on"]:
+            return
         hover_axes = tuple(m.ax for m in modes)
         if event.inaxes not in hover_axes or len(live["x"]) == 0:
             hover_dot.set_data([], [])
@@ -1015,6 +1032,8 @@ def main():
         return f"{v:.{decimals}f} {unit}"
 
     def on_timer() -> None:
+        if closing["on"]:
+            return  # a queued tick can still fire after the window closes
         # Keep the "waiting for load cell" banner in sync with the sampler
         # thread's hot-plug state (even while a run is stopped).
         if force_expected:
@@ -1204,6 +1223,8 @@ def main():
     def layout_bar(_event=None) -> None:
         # Pin Cycle/Shortcuts/Status to their rendered content widths so a
         # small window can't crush them; the Label cell takes what remains.
+        if closing["on"]:
+            return
         try:
             def frac_w(artist) -> float:  # rendered width as a bar fraction
                 return (artist.get_window_extent().width
@@ -1268,6 +1289,7 @@ def main():
         # alive after the last window closes, leaving the process running with
         # the serial port open — killing it then wedges the FTDI driver until
         # the adapter is replugged (open() fails with termios EINVAL).
+        closing["on"] = True   # queued callbacks must not touch the dying canvas
         timer.stop()
         stop_evt.set()
 
