@@ -364,9 +364,10 @@ def parse_args():
                         "no default assumed)")
     p.add_argument("--pressure-at-4ma", type=float, default=0.0, metavar="PSI",
                    help="Pressure at 4 mA")
-    p.add_argument("--pressure-input", type=int, choices=(1, 2), default=1,
+    p.add_argument("--pressure-input", type=int, choices=(1, 2), default=None,
                    metavar="N",
-                   help="Yocto-4-20mA-Rx input (genericSensor1 or 2)")
+                   help="Yocto-4-20mA-Rx input (genericSensor1 or 2); "
+                        "default: auto-select a live 4–20 mA loop")
     p.add_argument("--pressure-serial", default=None, metavar="SERIAL",
                    help="Pin Yocto-4-20mA-Rx module serial (default: first "
                         "discovered; with a pin, startup proceeds even if the "
@@ -613,11 +614,26 @@ def main():
         except OSError as exc:
             print(format_pressure_device_list(), file=sys.stderr)
             sys.exit(str(exc))
+        try:
+            first_ma = pressure_ch.read()
+            ma_now = (
+                f"{first_ma.value:.3f} mA" if first_ma is not None else "offline"
+            )
+        except OSError:
+            ma_now = "offline"
         panel_rows.append((
             "Pressure",
             f"Yocto-4-20mA-Rx {pressure_ch.serial} "
-            f"input {pressure_ch.input_n}  ({pressure_ch.port})",
+            f"input {pressure_ch.input_n}  ({pressure_ch.port})  "
+            f"now {ma_now}",
         ))
+        if pressure_ch.value_range and pressure_ch.value_range != pressure_ch.signal_range:
+            panel_rows.append((
+                "Yocto mapping",
+                f"signal {pressure_ch.signal_range} {pressure_ch.signal_unit} → "
+                f"value {pressure_ch.value_range} {pressure_ch.value_unit} "
+                "(loop mA recovered for CLI cal)",
+            ))
         panel_rows.append((
             "Pressure cal",
             f"{pressure_cal.psi_at_4ma:g} psi @ 4 mA → "
@@ -1257,6 +1273,8 @@ def main():
                 readout_lines.append(
                     f"{s.label}: {fmt(s.vals[-1], s.decimals, m.unit)}"
                 )
+        if pressure_ch is not None and pressure_ch.last_ma is not None:
+            readout_lines.append(f"Loop: {pressure_ch.last_ma:.3f} mA")
         readout_lines.append(t_last.strftime("%H:%M:%S.%f")[:-3])
         readout.set_text("\n".join(readout_lines))
         blit_frame()

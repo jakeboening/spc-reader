@@ -219,7 +219,7 @@ With the plot window focused:
 | `--temp-ch1-name` / `--temp-ch2-name` | `TC1` / `TC2` | Thermocouple legend names |
 | `--pressure-at-20ma` | required | Pressure (psi) at 20 mA when `--mode pressure` |
 | `--pressure-at-4ma` | `0` | Pressure (psi) at 4 mA |
-| `--pressure-input` | `1` | Yocto-4-20mA-Rx input (`1` or `2`) |
+| `--pressure-input` | auto | Yocto-4-20mA-Rx input (`1` or `2`); default picks a live loop |
 | `--pressure-serial` | auto | Pin the Yocto-4-20mA-Rx module serial |
 | `--window SECS` | `600` | Rolling window |
 | `--ymin` / `--ymax` | `0` / `30` | Displacement Y-axis (mm) |
