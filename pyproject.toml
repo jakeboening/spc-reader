@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spc-reader"
 version = "0.1.0"
-description = "Mitutoyo SPC displacement and force logger (Mark-10 or RS485 load cell) with live plotting"
+description = "Mitutoyo SPC displacement, force, temperature, and 4-20 mA pressure logger with live plotting"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

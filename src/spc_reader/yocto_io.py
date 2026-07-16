@@ -25,10 +25,22 @@ _DEVLIST_MIN_S = 2.0
 _api_freed = False
 
 
-def _yocto():
-    """Import the yoctopuce API lazily so the package is optional at import time."""
+def _yocto_api():
+    """Import the shared Yoctopuce hub API (used by temperature and pressure)."""
     try:
         from yoctopuce.yocto_api import YAPI, YAPI_Exception, YRefParam
+    except ImportError:
+        raise SystemExit(
+            "yoctopuce package not found (needed for --mode temperature / pressure). "
+            "Run:  pip install yoctopuce"
+        )
+    return YAPI, YAPI_Exception, YRefParam
+
+
+def _yocto():
+    """Import the yoctopuce temperature API lazily."""
+    YAPI, YAPI_Exception, YRefParam = _yocto_api()
+    try:
         from yoctopuce.yocto_temperature import YTemperature
     except ImportError:
         raise SystemExit(
@@ -47,7 +59,7 @@ def hub_target(port: str | None) -> str:
 
 def register_hub(target: str) -> None:
     """RegisterHub with retries while a starting VirtualHub reports 'not ready'."""
-    YAPI, YAPI_Exception, YRefParam, _ = _yocto()
+    YAPI, YAPI_Exception, YRefParam = _yocto_api()
     errmsg = YRefParam()
     for attempt in range(10):
         try:
@@ -66,6 +78,21 @@ def register_hub(target: str) -> None:
     )
     raise OSError(f"Cannot connect to Yoctopuce hub {target!r}: {errmsg.value}{hint}")
 
+
+def free_yocto_api() -> None:
+    """Release the process-global YAPI once (safe to call from every channel close)."""
+    global _api_freed
+    if _api_freed:
+        return
+    _api_freed = True
+    try:
+        YAPI, YAPI_Exception, _ = _yocto_api()
+    except SystemExit:
+        return
+    try:
+        YAPI.FreeAPI()
+    except YAPI_Exception:
+        pass
 
 def discover_temperature_modules() -> list[str]:
     """Serial numbers of modules exposing temperature functions, in enum order."""
@@ -130,14 +157,7 @@ class TemperatureChannel:
             pass
 
     def close(self) -> None:
-        global _api_freed
-        if _api_freed:
-            return
-        _api_freed = True
-        try:
-            self._YAPI.FreeAPI()
-        except self._YAPI_Exception:
-            pass
+        free_yocto_api()
 
 
 def open_temperature_channels(

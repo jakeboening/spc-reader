@@ -1,13 +1,14 @@
-# Force, displacement, and temperature logger
+# Force, displacement, temperature, and pressure logger
 
 Real-time multi-mode plot and HDF5 logger. Pick one or more modes with
-`--mode force displacement temperature`; each mode gets its own y-axis:
+`--mode force displacement temperature pressure`; each mode gets its own y-axis:
 
 - **displacement** — Mitutoyo Digimatic SPC linear gauge (mm) on the 10-pin connector (USB-ITN, IT-016U, or serial bridge)
 - **force** — Mark-10 Series 5 (GCL2 over USB serial) or RS485 load cell transmitter (Modbus RTU, WTQ-style register map), in N
 - **temperature** — Yoctopuce Yocto-Thermocouple, both inputs (°C), direct USB or via VirtualHub/YoctoHub
+- **pressure** — 4–20 mA pressure transmitter via Yocto-4-20mA-Rx (psi), calibrated on the command line
 
-- 600 s scrolling window; displacement **0–30 mm**, force **±44.5 N** (M5-10 default), temperature **0–800 °C**
+- 600 s scrolling window; displacement **0–30 mm**, force **±44.5 N** (M5-10 default), temperature **0–800 °C**, pressure from calibration
 - Hover tooltip on the live chart
 - Each user’s log defaults to **`~/.local/share/spc-reader/force_and_displacement.h5`**
 
@@ -77,7 +78,7 @@ The default log is `%USERPROFILE%\.local\share\spc-reader\force_and_displacement
 
 **Displacement on Windows:** an IT-016U or RS-232 serial bridge works as a normal COM port (`--mode displacement --port COM6`). The **USB-ITN** is read through pyusb, which on Windows additionally needs a libusb-1.0 backend and the WinUSB driver bound to the adapter (e.g. with [Zadig](https://zadig.akeo.ie/)) — it has only been tested on Linux/macOS. Leaving `displacement` out of `--mode` avoids this entirely.
 
-**Temperature on Windows:** the yoctopuce package bundles its native DLLs, so `spc-plot --mode temperature` talks to the Yocto-Thermocouple over USB with no extra driver or VirtualHub install.
+**Temperature / pressure on Windows:** the yoctopuce package bundles its native DLLs, so `spc-plot --mode temperature` and `--mode pressure` talk to Yoctopuce modules over USB with no extra driver or VirtualHub install.
 
 ---
 
@@ -165,11 +166,14 @@ pip install -r requirements.txt
 Gauge ── 10-pin SPC cable ── USB Input Tool (USB-ITN / IT-020U / …) ── PC USB
 Mark-10 M5-10 ── micro USB ── PC USB  (gauge menu: Serial/USB → USB selected)
 Load cell ── 4-wire ── RS485 transmitter ── USB-RS485 adapter ── PC USB
+4-20 mA pressure transmitter ── Yocto-4-20mA-Rx ── PC USB
 ```
 
 USB-ITN appears as USB `0fe7:4001` and is read via **pyusb** (not a tty). The Mark-10 exposes a virtual COM port (`/dev/ttyUSB*` or `/dev/ttyACM*`). An RS485 load cell transmitter connects through a USB-RS485 adapter on `/dev/ttyUSB*` (macOS: `/dev/cu.usbserial-*`, Windows: `COMx`).
 
 The Yocto-Thermocouple is read via the **yoctopuce** library, by default directly over USB (`--port temperature=usb`) — note direct USB needs exclusive access, so quit VirtualHub if it is running. Passing `--port temperature=HOST:PORT` connects to a VirtualHub/YoctoHub instead. **All connected modules are plotted automatically** — each contributes two lines (TC1, TC2, TC3, … numbered across modules in discovery order); `--temp-serial` (repeatable) pins specific modules and sets their order. An input with no probe (or an unplugged module) records NaN. Modules must be present (or pinned) at startup to be included.
+
+The Yocto-4-20mA-Rx is read the same way (`--port pressure=usb` by default). Loop current comes from `get_signalValue()` (mA); pressure in psi is computed in software from `--pressure-at-4ma` / `--pressure-at-20ma`. Use `--pressure-input 1|2` to pick `genericSensor1` or `genericSensor2`, and `--pressure-serial` to pin a module.
 
 On the Mark-10: open **Serial/USB Settings**, select **USB**, set baud to **115200** (match `--force-baud`) and **Numeric + Units** data format. The gauge must be on the main measurement screen (not a menu) for GCL2 commands.
 
@@ -186,12 +190,13 @@ spc-plot --mode displacement --port usb-itn:40006743 --tag "run 42"
 spc-plot --mode force --port /dev/ttyUSB0              # Mark-10
 spc-plot --mode force --force-type loadcell --port /dev/ttyUSB0 --loadcell-range 100kg
 spc-plot --mode temperature                            # Yocto-Thermocouple, direct USB
+spc-plot --mode pressure --pressure-at-20ma 100        # 0 psi @ 4 mA → 100 psi @ 20 mA
 spc-plot --mode force temperature --force-type loadcell \
     --port force=/dev/ttyUSB0 --port temperature=usb --loadcell-range 100kg
 spc-plot --mode displacement force temperature         # three y-axes
 ```
 
-`--mode` is required and takes one or more of `force`, `displacement`, `temperature`; the first mode owns the left y-axis and each further mode adds an axis on the right. `--port` is `MODE=VALUE` (repeatable); a bare `--port VALUE` is allowed when only one active mode needs it, and any mode without a port auto-detects its device.
+`--mode` is required and takes one or more of `force`, `displacement`, `temperature`, `pressure`; the first mode owns the left y-axis and each further mode adds an axis on the right. `--port` is `MODE=VALUE` (repeatable); a bare `--port VALUE` is allowed when only one active mode needs it, and any mode without a port auto-detects its device. Pressure mode always requires `--pressure-at-20ma` (transmitter full-scale at 20 mA); `--pressure-at-4ma` defaults to 0.
 
 With the plot window focused:
 
@@ -203,8 +208,8 @@ With the plot window focused:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mode MODE...` | required | One or more of `force`, `displacement`, `temperature` |
-| `--port [MODE=]VALUE` | auto | Per-mode port. Displacement: `usb-itn[:SERIAL]` or `/dev/tty*`; force: serial port (`/dev/tty*`, `COMx`); temperature: `usb` or `HOST:PORT` of a VirtualHub/YoctoHub |
+| `--mode MODE...` | required | One or more of `force`, `displacement`, `temperature`, `pressure` |
+| `--port [MODE=]VALUE` | auto | Per-mode port. Displacement: `usb-itn[:SERIAL]` or `/dev/tty*`; force: serial port (`/dev/tty*`, `COMx`); temperature/pressure: `usb` or `HOST:PORT` of a VirtualHub/YoctoHub |
 | `--force-type` | `mark10` | `mark10` or `loadcell` (RS485 Modbus RTU) |
 | `--force-baud` | see below | `115200` (Mark-10) or `9600` (load cell) |
 | `--loadcell-range` | `100kg` | Full scale: `10kg` … `1000kg` (sets Y-axis and scaling metadata) |
@@ -212,10 +217,15 @@ With the plot window focused:
 | `--loadcell-decimals` | auto | Override decimal places from transmitter |
 | `--temp-serial` | auto | Pin the Yocto-Thermocouple module serial |
 | `--temp-ch1-name` / `--temp-ch2-name` | `TC1` / `TC2` | Thermocouple legend names |
+| `--pressure-at-20ma` | required | Pressure (psi) at 20 mA when `--mode pressure` |
+| `--pressure-at-4ma` | `0` | Pressure (psi) at 4 mA |
+| `--pressure-input` | `1` | Yocto-4-20mA-Rx input (`1` or `2`) |
+| `--pressure-serial` | auto | Pin the Yocto-4-20mA-Rx module serial |
 | `--window SECS` | `600` | Rolling window |
 | `--ymin` / `--ymax` | `0` / `30` | Displacement Y-axis (mm) |
 | `--fmin` / `--fmax` | ±44.5 N | Force Y-axis (N); default is M5-10 full scale |
 | `--tmin` / `--tmax` | `0` / `800` | Temperature Y-axis (°C) |
+| `--pmin` / `--pmax` | cal span | Pressure Y-axis (psi); default is min/max of calibration points |
 | `--hz` | `30` | Poll rate |
 | `--data-file` | see above | HDF5 log |
 
@@ -240,18 +250,23 @@ cycles/000001/
   force_counts      float64[]   raw ADC counts (registers 40015/16), load cell only
   temperature1_c    float32[]   thermocouple 1 (°C), temperature mode only
   temperature2_c    float32[]   thermocouple 2 (°C), temperature mode only
+  pressure_psi      float32[]   calibrated pressure (psi), pressure mode only
+  pressure_ma       float64[]   raw loop current (mA), pressure mode only
   attrs: tag, label, serial, hz, start_iso, units, channel_name
           force_serial, force_units, force_channel_name, force_capacity_n  (when force logged)
           force_counts_source, force_cal_source            (load cell only)
           force_cal_zero_counts, force_cal_counts_per_kg   (when raw calibration active)
           temp_serial, temp_units, temp_ch1_name, temp_ch2_name  (when temperature logged)
+          pressure_serial, pressure_units, pressure_channel_name, pressure_input
+          pressure_ma_source, pressure_cal_psi_at_4ma, pressure_cal_psi_at_20ma
 ```
 
 `force_cal_source` records how `force_n` was derived: `raw-adc` (counts mapped
 through the saved 2-point calibration, whose parameters are stored alongside) or
 `scaled-register` (transmitter's own scaling; no calibration was loaded). Raw
 counts are always logged for the load cell, so any cycle can be re-converted
-after a later calibration.
+after a later calibration. Likewise, `pressure_ma` is always logged with
+`pressure_psi`, and the CLI calibration points are stored as cycle attributes.
 
 ---
 
@@ -262,3 +277,5 @@ after a later calibration.
 **Mark-10 GCL2:** host sends `?C` + CR for the real-time reading, or consumes auto-output lines. The gauge may send e.g. `0.42 N` or `0.094 lbF`; values are normalized to **N** for plot and log.
 
 **RS485 load cell (Modbus RTU):** function 03 read of registers 40007–40014 (status, gross weight, divisions/unit). Weight is an integer with implied decimal places; sign comes from the status register. Values are converted to **N** using the transmitter unit (typically kg).
+
+**Yocto-4-20mA-Rx:** polled via Yoctopuce `YGenericSensor.get_signalValue()` (mA). Pressure is `psi_at_4ma + (mA − 4) / 16 × (psi_at_20ma − psi_at_4ma)`.

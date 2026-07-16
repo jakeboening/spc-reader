@@ -2,7 +2,8 @@
 """Real-time multi-mode plotter and HDF5 logger.
 
 Modes (one y-axis each, any combination): displacement (Mitutoyo SPC),
-force (Mark-10 or RS485 load cell), temperature (Yoctopuce thermocouple).
+force (Mark-10 or RS485 load cell), temperature (Yoctopuce thermocouple),
+pressure (Yocto-4-20mA-Rx).
 """
 
 import argparse
@@ -53,10 +54,18 @@ from .mark10_io import (
     to_n,
 )
 from .paths import default_log_path, resolve_data_path
+from .pressure_io import (
+    PressureCalibration,
+    PressureChannel,
+    format_pressure_device_list,
+    open_pressure_channel,
+)
 from .spc_io import (
     DISPLACEMENT_DATASET,
     FORCE_COUNTS_DATASET,
     FORCE_DATASET,
+    PRESSURE_DATASET,
+    PRESSURE_MA_DATASET,
     Reading,
     SPCChannel,
     auto_port,
@@ -72,10 +81,11 @@ from .yocto_io import (
     to_c,
 )
 
-MODES = ("force", "displacement", "temperature")
+MODES = ("force", "displacement", "temperature", "pressure")
 
 DISP_COLOR = "#eb6834"   # orange — displacement series
 FORCE_COLOR = "#2a78d6"  # blue — force series
+PRESSURE_COLOR = "#9f1239"  # rose — pressure series
 # Thermocouple palette, cycled TC1, TC2, ... across however many modules are
 # connected; hues chosen to stay distinct from the orange/blue above.
 TEMP_COLORS = ("#9333ea", "#0d9488", "#db2777", "#65a30d", "#b45309", "#64748b")
@@ -91,6 +101,7 @@ REC_GREEN = "#067647"    # recording chip
 UNIT_MM = "mm"
 UNIT_N = "N"
 UNIT_C = "°C"
+UNIT_PSI = "psi"
 # M5-10 full scale: 10 lbf ≈ 44.5 N
 DEFAULT_FORCE_MAX_N = 10 * 4.4482216152605
 # Load cell default view: positive-only, 0 → 250 N.
@@ -279,19 +290,20 @@ def resolve_ports(p: argparse.ArgumentParser, modes: list[str],
 def parse_args():
     p = argparse.ArgumentParser(
         description="Displacement (Mitutoyo SPC), force (Mark-10 or RS485 load cell), "
-                    "and temperature (Yoctopuce thermocouple) logger with live plotting",
+                    "temperature (Yoctopuce thermocouple), and pressure "
+                    "(Yocto-4-20mA-Rx) logger with live plotting",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--mode", nargs="+", choices=MODES, metavar="MODE",
-                   help="Channels to plot/log: force, displacement, temperature. "
-                        "The first mode owns the left y-axis; each further mode "
-                        "adds its own y-axis on the right.")
+                   help="Channels to plot/log: force, displacement, temperature, "
+                        "pressure. The first mode owns the left y-axis; each "
+                        "further mode adds its own y-axis on the right.")
     p.add_argument("--port", action="append", default=[], metavar="[MODE=]VALUE",
                    help="Port for a mode, e.g. --port force=COM5 --port temperature=usb. "
                         "Repeatable; a bare VALUE binds to the only portless mode; "
                         "omitted ports auto-detect. Displacement: usb-itn[:SERIAL] "
-                        "or serial port; force: serial port; temperature: usb or "
-                        "HOST:PORT of a VirtualHub/YoctoHub.")
+                        "or serial port; force: serial port; temperature/pressure: "
+                        "usb or HOST:PORT of a VirtualHub/YoctoHub.")
     p.add_argument("--baud", type=int, default=9600,
                    help="Displacement serial baud")
     p.add_argument("--list-ports", action="store_true",
@@ -347,6 +359,24 @@ def parse_args():
                    help="Thermocouple 1 legend")
     p.add_argument("--temp-ch2-name", default="TC2", metavar="NAME",
                    help="Thermocouple 2 legend")
+    p.add_argument("--pressure-at-20ma", type=float, default=None, metavar="PSI",
+                   help="Pressure at 20 mA (required with --mode pressure; "
+                        "no default assumed)")
+    p.add_argument("--pressure-at-4ma", type=float, default=0.0, metavar="PSI",
+                   help="Pressure at 4 mA")
+    p.add_argument("--pressure-input", type=int, choices=(1, 2), default=1,
+                   metavar="N",
+                   help="Yocto-4-20mA-Rx input (genericSensor1 or 2)")
+    p.add_argument("--pressure-serial", default=None, metavar="SERIAL",
+                   help="Pin Yocto-4-20mA-Rx module serial (default: first "
+                        "discovered; with a pin, startup proceeds even if the "
+                        "module is offline)")
+    p.add_argument("--pressure-ch-name", default="Pressure", metavar="NAME",
+                   help="Pressure legend")
+    p.add_argument("--pmin", type=float, default=None, metavar="PSI",
+                   help="Pressure Y-axis min (default: min of calibration points)")
+    p.add_argument("--pmax", type=float, default=None, metavar="PSI",
+                   help="Pressure Y-axis max (default: max of calibration points)")
     p.add_argument(
         "--data-file", default=default_log_path(), metavar="PATH",
         help=f"HDF5 log (default: {default_log_path()})",
@@ -359,6 +389,9 @@ def parse_args():
         # Dedupe while keeping the user's axis order.
         args.mode = list(dict.fromkeys(args.mode))
         args.ports = resolve_ports(p, args.mode, args.port)
+        if "pressure" in args.mode and args.pressure_at_20ma is None:
+            p.error("--pressure-at-20ma is required with --mode pressure "
+                    "(transmitter full-scale pressure at 20 mA, in psi)")
     return args
 
 
@@ -437,6 +470,8 @@ def main():
         print(format_loadcell_device_list())
         print()
         print(format_temperature_device_list())
+        print()
+        print(format_pressure_device_list())
         return
 
     mode_names: list[str] = args.mode
@@ -561,6 +596,34 @@ def main():
                 ("Temperature", f"Yocto-Thermocouple {tch.serial}  ({tch.port})")
             )
 
+    pressure_ch: PressureChannel | None = None
+    pressure_cal: PressureCalibration | None = None
+    if "pressure" in mode_names:
+        pressure_cal = PressureCalibration(
+            psi_at_4ma=args.pressure_at_4ma,
+            psi_at_20ma=args.pressure_at_20ma,
+        )
+        try:
+            pressure_ch = open_pressure_channel(
+                ports["pressure"] or "usb",
+                serial=args.pressure_serial,
+                input_n=args.pressure_input,
+                cal=pressure_cal,
+            )
+        except OSError as exc:
+            print(format_pressure_device_list(), file=sys.stderr)
+            sys.exit(str(exc))
+        panel_rows.append((
+            "Pressure",
+            f"Yocto-4-20mA-Rx {pressure_ch.serial} "
+            f"input {pressure_ch.input_n}  ({pressure_ch.port})",
+        ))
+        panel_rows.append((
+            "Pressure cal",
+            f"{pressure_cal.psi_at_4ma:g} psi @ 4 mA → "
+            f"{pressure_cal.psi_at_20ma:g} psi @ 20 mA",
+        ))
+
     # In load cell mode the force channel counts as present even while the
     # adapter is unplugged — datasets/axes are created up front and samples
     # start flowing the moment the device (re)appears.
@@ -619,7 +682,7 @@ def main():
             title_parts.append(
                 "load cell force" if is_loadcell else "Mark-10 force"
             )
-        else:  # temperature
+        elif name == "temperature":
             # TC numbering is continuous across modules: module i (0-based)
             # contributes TC 2i+1 and 2i+2 on the shared temperature axis.
             temp_series: list[Series] = []
@@ -641,6 +704,28 @@ def main():
             modes.append(Mode(name, UNIT_C, temp_series[0].color,
                               (args.tmin, args.tmax), temp_series))
             title_parts.append("thermocouple temperature")
+        else:  # pressure
+            pmin = (args.pmin if args.pmin is not None
+                    else min(pressure_cal.psi_at_4ma, pressure_cal.psi_at_20ma))
+            pmax = (args.pmax if args.pmax is not None
+                    else max(pressure_cal.psi_at_4ma, pressure_cal.psi_at_20ma))
+            if pmin == pmax:
+                pmax = pmin + 1.0  # avoid a zero-height axis
+            modes.append(Mode(name, UNIT_PSI, PRESSURE_COLOR, (pmin, pmax), [
+                make_series(PRESSURE_DATASET, args.pressure_ch_name,
+                            PRESSURE_COLOR, 2),
+            ]))
+            log_columns.append((PRESSURE_DATASET, "f4"))
+            # Raw mA is logged but not plotted (no Series), like force_counts.
+            log_columns.append((PRESSURE_MA_DATASET, "f8"))
+            log_attrs["pressure_serial"] = pressure_ch.serial
+            log_attrs["pressure_units"] = UNIT_PSI
+            log_attrs["pressure_channel_name"] = args.pressure_ch_name
+            log_attrs["pressure_input"] = pressure_ch.input_n
+            log_attrs["pressure_ma_source"] = "YGenericSensor.get_signalValue()"
+            log_attrs["pressure_cal_psi_at_4ma"] = pressure_cal.psi_at_4ma
+            log_attrs["pressure_cal_psi_at_20ma"] = pressure_cal.psi_at_20ma
+            title_parts.append("4-20 mA pressure")
 
     all_series = [(m, s) for m in modes for s in m.series]
 
@@ -675,10 +760,10 @@ def main():
     multi = len(modes) > 1
     for i, mode in enumerate(modes):
         mode.ax = ax_main if i == 0 else ax_main.twinx()
-        if i == 2:
-            # A third axis also sits on the right; push its spine outward so
-            # the two right-hand scales don't overprint.
-            mode.ax.spines["right"].set_position(("outward", 55))
+        if i >= 2:
+            # Extra right-hand axes: push each spine outward so scales don't
+            # overprint (third at 55, fourth at 110, ...).
+            mode.ax.spines["right"].set_position(("outward", 55 * (i - 1)))
         for s in mode.series:
             s.line, = mode.ax.plot([], [], color=s.color, linewidth=2,
                                    label=s.label)
@@ -1019,7 +1104,7 @@ def main():
     # Whether any channel besides the hot-pluggable load cell produces samples;
     # with none, the sampler idles instead of logging all-NaN rows while the
     # adapter is absent.
-    other_readers = ch is not None or bool(temp_chs)
+    other_readers = ch is not None or bool(temp_chs) or pressure_ch is not None
     # Dataset keys per temperature channel, in module order (TC 2i+1, 2i+2).
     temp_keys = [(temp_dataset(2 * i + 1), temp_dataset(2 * i + 2))
                  for i in range(len(temp_chs))]
@@ -1053,6 +1138,14 @@ def main():
                 values[DISPLACEMENT_DATASET] = poll_channel(ch)
             for tch, (key1, key2) in zip(temp_chs, temp_keys):
                 values[key1], values[key2] = poll_temperature(tch)
+            if pressure_ch is not None:
+                try:
+                    values[PRESSURE_DATASET] = pressure_ch.read_psi()
+                except OSError as exc:
+                    print(f"  Pressure read error on {pressure_ch.port}: {exc}",
+                          file=sys.stderr)
+                    values[PRESSURE_DATASET] = float("nan")
+                values[PRESSURE_MA_DATASET] = pressure_ch.last_ma
             if fch is not None:
                 reading = None
                 read_exc: OSError | None = None
@@ -1174,9 +1267,9 @@ def main():
 
     fig.tight_layout(rect=(0, 0, 1, 0.862))
     if len(modes) > 2:
-        # Leave room for the third axis's outward-offset spine; must happen
-        # before main_pos is read so the info bar spans the adjusted width.
-        fig.subplots_adjust(right=0.90)
+        # Leave room for extra right-hand axis spines; must happen before
+        # main_pos is read so the info bar spans the adjusted width.
+        fig.subplots_adjust(right=0.90 if len(modes) == 3 else 0.84)
 
     # Top info bar: one panel spanning the plot width, split into cells —
     # Cycle | Label (text entry) | Shortcuts | Status. Fieldset style: each
@@ -1383,7 +1476,7 @@ def main():
             logger.close()
         except Exception as exc:  # e.g. a signal landed mid-flush
             print(f"  Warning: final log flush failed: {exc}", file=sys.stderr)
-        for c in (ch, force["ch"], *temp_chs):
+        for c in (ch, force["ch"], pressure_ch, *temp_chs):
             if c is not None:
                 try:
                     c.close()

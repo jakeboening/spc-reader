@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot a recorded cycle (displacement / force / temperature) from the HDF5 log.
+"""Plot a recorded cycle (displacement / force / temperature / pressure) from the HDF5 log.
 
 Usage
 -----
@@ -25,7 +25,9 @@ from .spc_io import (
     DISPLACEMENT_DATASET,
     FORCE_DATASET,
     LBF_TO_N,
+    PRESSURE_DATASET,
     read_force_n,
+    read_pressure_psi,
     read_temperature_channels,
     temp_dataset,
     try_read_displacement_mm,
@@ -33,6 +35,7 @@ from .spc_io import (
 
 DISP_COLOR = "#eb6834"   # orange — displacement series (matches plot_live)
 FORCE_COLOR = "#2a78d6"  # blue — force series (matches plot_live)
+PRESSURE_COLOR = "#9f1239"  # rose — pressure series (matches plot_live)
 # Thermocouple palette, cycled by TC number (matches plot_live).
 TEMP_COLORS = ("#9333ea", "#0d9488", "#db2777", "#65a30d", "#b45309", "#64748b")
 
@@ -77,6 +80,16 @@ def load_channels(grp, meta: dict) -> list[dict]:
             # Autoscale on read-back — exploration beats fixed limits here.
             "kind": "temperature", "unit": "°C", "decimals": 1, "ylim": None,
             "series": temp_series,
+        })
+    pressure_psi = read_pressure_psi(grp)
+    if pressure_psi is not None and len(pressure_psi):
+        channels.append({
+            "kind": "pressure", "unit": "psi", "decimals": 2, "ylim": None,
+            "series": [(
+                PRESSURE_DATASET,
+                meta.get("pressure_channel_name", "Pressure"),
+                PRESSURE_COLOR, pressure_psi,
+            )],
         })
     return channels
 
@@ -250,9 +263,9 @@ def plot_cycle(
     legend_labels = []
     for i, chn in enumerate(channels):
         ax = ax_main if i == 0 else ax_main.twinx()
-        if i == 2:
-            # Third axis also sits on the right; offset its spine outward.
-            ax.spines["right"].set_position(("outward", 55))
+        if i >= 2:
+            # Extra right-hand axes: offset each spine so scales don't overprint.
+            ax.spines["right"].set_position(("outward", 55 * (i - 1)))
         chn["ax"] = ax
         for _key, label, color, arr in chn["series"]:
             ln, = ax.plot(t_rel, arr, color=color, linewidth=1.5, label=label)
@@ -349,8 +362,8 @@ def plot_cycle(
     fig.canvas.mpl_connect("motion_notify_event", on_hover)
     plt.tight_layout()
     if len(channels) > 2:
-        # Room for the third axis's outward-offset spine.
-        fig.subplots_adjust(right=0.88)
+        # Room for extra right-hand axis spines.
+        fig.subplots_adjust(right=0.88 if len(channels) == 3 else 0.82)
     plt.show()
 
 

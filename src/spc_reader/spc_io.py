@@ -22,6 +22,8 @@ UNITS = {0: "mm", 1: "in"}
 DISPLACEMENT_DATASET = "displacement_mm"
 FORCE_DATASET = "force_n"
 FORCE_COUNTS_DATASET = "force_counts"
+PRESSURE_DATASET = "pressure_psi"
+PRESSURE_MA_DATASET = "pressure_ma"
 # The "_c" suffix is load-bearing: bare "temperature1" is a legacy alias for
 # displacement (see _LEGACY_DISPLACEMENT_KEYS) and must stay distinct.
 # Thermocouples are numbered continuously across modules: module i (0-based)
@@ -257,6 +259,13 @@ def read_force_n(grp) -> "np.ndarray | None":
         return grp[FORCE_DATASET][:]
     if "force_lbf" in grp:
         return grp["force_lbf"][:] * LBF_TO_N
+    return None
+
+
+def read_pressure_psi(grp) -> "np.ndarray | None":
+    """Load pressure samples in psi if present; otherwise None."""
+    if PRESSURE_DATASET in grp:
+        return grp[PRESSURE_DATASET][:]
     return None
 
 
